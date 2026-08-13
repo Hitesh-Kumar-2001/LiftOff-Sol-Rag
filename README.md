@@ -45,14 +45,74 @@ one JSON body:
 `serverId` + `serverSecret` say *who is asking*; `question` + `ragDbId` say
 *what to answer and from where*.
 
+## Submitting a document
+
+`POST /api/v1/document` queues a document for ingestion and returns right away
+— it does not wait for processing:
+
+```json
+{
+  "serverId": "billing-service",
+  "serverSecret": "top-secret",
+  "documentLink": "https://example.com/handbook.pdf",
+  "ragDbId": "handbook"
+}
+```
+
+```json
+{
+  "jobId": "handbook",
+  "status": "queued"
+}
+```
+
+| Status | Meaning |
+| ------ | ------- |
+| 202 | Verified caller; job created and running in the background |
+| 401 | `serverId` unknown, or `serverSecret` wrong |
+| 422 | A field is missing, blank, or unexpected |
+
+`jobId` is the `ragDbId` itself, not a generated id — a job exists to populate
+one RAG database, so there's nothing else meaningful to key it by. A second
+submission for a `ragDbId` that already has a job reuses that same job id and
+replaces the previous record; the earlier task is *not* cancelled, it just runs
+to completion writing into a `Job` nothing can look up anymore. Deduplicating,
+queueing, or cancelling on resubmission is a policy decision for later.
+
+What "processing" a document means beyond metadata extraction — chunking,
+embedding, writing into the `ragDbId` — is not fully decided yet. See
+[app/documents.py](app/documents.py): `DocumentProcessor` is the contract real
+ingestion plugs into; `StubDocumentProcessor` just marks the job done without
+doing anything. There is no endpoint yet to poll a job's status — a natural
+next addition.
+
+Jobs live in memory only and do not survive a restart. On shutdown, the app
+*waits* for any job still running rather than cancelling it — a job mid-download
+or mid-analysis has no safe halfway point to stop at. This can't hang forever:
+a download is capped at `DOWNLOAD_TIMEOUT_SECONDS`, so every job finishes (or
+fails) on its own well within that. There is no job eviction yet — old jobs
+stay in memory until the process restarts; when that's needed it'll be its own
+endpoint, not part of submission.
+
+A `.zip` or `.rar` is searched recursively — an archive containing another
+archive is unpacked in turn, however many levels deep (capped at
+`MAX_ARCHIVE_DEPTH`, currently 5, to bound a maliciously nested archive). A
+nested file's `filename` carries its full path, e.g.
+`outer.zip/inner.rar/doc.pdf`, so the origin stays visible even though the
+result is a flat list. `DocumentMetadata` also totals `pageCount`,
+`imageCount`, and `tableCount` across every file found, at every depth.
+
 ## How it works
 
 ### The pieces
 
 | File | Responsibility |
 | ---- | -------------- |
-| [app/main.py](app/main.py) | Builds the app; loads credentials at startup and keeps them fresh for the process lifetime |
-| [app/routes.py](app/routes.py) | The endpoint: verify the caller, then answer |
+| [app/main.py](app/main.py) | Builds the app; loads credentials at startup, keeps them fresh, and cancels in-flight jobs on shutdown |
+| [app/routes.py](app/routes.py) | The endpoints: verify the caller, then answer or queue |
+| [app/job_manager.py](app/job_manager.py) | What the API talks to for jobs — create, look up by id, shut down cleanly |
+| [app/jobs.py](app/jobs.py) | A job's data (`Job`, `JobStatus`) and `run_job`, which knows how to execute one |
+| [app/documents.py](app/documents.py) | The `DocumentProcessor` contract, plus the real (and stub) implementations |
 | [app/schemas.py](app/schemas.py) | The wire contract — camelCase JSON in and out, snake_case in Python |
 | [app/security.py](app/security.py) | Holds credentials in RAM and checks them |
 | [app/credentials.py](app/credentials.py) | Where credentials come from, and whether that source can change |
@@ -165,7 +225,15 @@ Both hold the servers allowed to call the API:
   and echoed back but nothing resolves it to an actual database yet.
 - **Per-server access control.** Any verified server may name any `ragDbId`.
   Worth adding before two tenants share the deployment.
-- **A Firestore adapter.** The seam is ready; the adapter is not written.
+- **A Firestore adapter** for credentials. The seam is ready; the adapter is not
+  written.
+- **Ingestion past metadata.** `POST /document` downloads and analyzes the
+  document (see [app/documents.py](app/documents.py)) but nothing chunks,
+  embeds, or writes it into the `ragDbId` yet.
+- **Job status.** No way to poll a `jobId` after submission, and no persistence
+  — jobs vanish on restart.
+- **Job eviction.** Old jobs never leave memory. Planned as its own endpoint,
+  separate from submission.
 
 ## Test
 

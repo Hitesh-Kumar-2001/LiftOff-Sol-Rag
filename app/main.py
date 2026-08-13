@@ -4,6 +4,7 @@ from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
 
+from app.job_manager import get_job_manager
 from app.routes import router
 from app.security import get_server_registry, refreshing
 
@@ -20,8 +21,14 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     # process that cannot read the credential store should not accept traffic.
     logger.info("Loaded %d server credentials.", await registry.load_all())
 
-    async with refreshing(registry):
-        yield
+    jobs = get_job_manager()
+    try:
+        async with refreshing(registry):
+            yield
+    finally:
+        # Let in-flight ingestion jobs be cancelled cleanly rather than killed
+        # mid-write when the process exits.
+        await jobs.shutdown()
 
 
 app = FastAPI(title="RAG API", version="0.1.0", lifespan=lifespan)

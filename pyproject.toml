@@ -5,10 +5,13 @@ requires-python = ">=3.12"
 dependencies = [
     "fastapi>=0.141.1",
     "uvicorn[standard]>=0.52.2",
+    "httpx>=0.28.1",
+    "pdfplumber>=0.11.10",
+    "python-docx>=1.2.0",
+    "rarfile>=4.5",
 ]
 
 [dependency-groups]
 dev = [
-    "httpx>=0.28.1",
     "pytest>=9.1.1",
 ]
