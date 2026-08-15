@@ -9,9 +9,9 @@ from app.credentials import (
     FileCredentialSource,
     InMemoryCredentialSource,
     ServerCredential,
-    build_credential_source,
-    hash_secret,
-    parse_credentials,
+    buildCredentialSource,
+    hashSecret,
+    parseCredentials,
 )
 from app.security import AuthenticationError, ServerRegistry, refreshing
 
@@ -22,123 +22,123 @@ SETTLE = 0.15
 CREDENTIAL_JSON = '{"svc": {"secret": "abc"}}'
 
 
-def credential(server_id: str = "svc", secret: str = "abc") -> ServerCredential:
-    return ServerCredential(server_id=server_id, secret_hash=hash_secret(secret))
+def credential(serverId: str = "svc", secret: str = "abc") -> ServerCredential:
+    return ServerCredential(serverId=serverId, secretHash=hashSecret(secret))
 
 
 class FakeStore(InMemoryCredentialSource):
     """A shared store: editable, pollable, and able to go down like a real one."""
 
-    def __init__(self, credentials=(), refresh_interval: float | None = TICK) -> None:
+    def __init__(self, credentials=(), refreshInterval: float | None = TICK) -> None:
         super().__init__(credentials)
-        self.refresh_interval = refresh_interval
+        self.refreshInterval = refreshInterval
         self.reads = 0
         self.down = False
 
-    async def load_all(self):
+    async def loadAll(self):
         self.reads += 1
         if self.down:
             raise ConnectionError("store unreachable")
-        return await super().load_all()
+        return await super().loadAll()
 
     def put(self, cred: ServerCredential) -> None:
-        self._by_id[cred.server_id] = cred
+        self._byId[cred.serverId] = cred
 
-    def remove(self, server_id: str) -> None:
-        self._by_id.pop(server_id, None)
+    def remove(self, serverId: str) -> None:
+        self._byId.pop(serverId, None)
 
 
 # --- parsing -----------------------------------------------------------------
 
 
-def test_parse_credentials_accepts_a_plaintext_secret() -> None:
-    [cred] = parse_credentials('{"svc": {"secret": "abc"}}')
+def testParseCredentialsAcceptsAPlaintextSecret() -> None:
+    [cred] = parseCredentials('{"svc": {"secret": "abc"}}')
 
-    assert cred.server_id == "svc"
+    assert cred.serverId == "svc"
     assert cred.matches("abc")
 
 
-def test_parse_credentials_accepts_a_precomputed_digest() -> None:
-    [cred] = parse_credentials('{"svc": {"secretSha256": "%s"}}' % hash_secret("abc"))
+def testParseCredentialsAcceptsAPrecomputedDigest() -> None:
+    [cred] = parseCredentials('{"svc": {"secretSha256": "%s"}}' % hashSecret("abc"))
 
     assert cred.matches("abc")
 
 
-def test_parse_credentials_rejects_an_entry_without_a_secret() -> None:
+def testParseCredentialsRejectsAnEntryWithoutASecret() -> None:
     with pytest.raises(CredentialConfigError):
-        parse_credentials('{"svc": {}}')
+        parseCredentials('{"svc": {}}')
 
 
-def test_parse_credentials_rejects_malformed_json() -> None:
+def testParseCredentialsRejectsMalformedJson() -> None:
     with pytest.raises(CredentialConfigError):
-        parse_credentials("not json")
+        parseCredentials("not json")
 
 
-def test_an_unset_environment_yields_an_empty_store() -> None:
-    assert asyncio.run(EnvCredentialSource("").load_all()) == []
+def testAnUnsetEnvironmentYieldsAnEmptyStore() -> None:
+    assert asyncio.run(EnvCredentialSource("").loadAll()) == []
 
 
-def test_a_bad_document_names_the_store_it_came_from() -> None:
+def testABadDocumentNamesTheStoreItCameFrom() -> None:
     with pytest.raises(CredentialConfigError, match="creds.json"):
-        parse_credentials("not json", "creds.json")
+        parseCredentials("not json", "creds.json")
 
 
 # --- choosing a store --------------------------------------------------------
 
 
-def test_credentials_load_from_a_file(tmp_path) -> None:
+def testCredentialsLoadFromAFile(tmp_path) -> None:
     path = tmp_path / "creds.json"
     path.write_text(CREDENTIAL_JSON, encoding="utf-8")
 
-    [cred] = asyncio.run(FileCredentialSource(path).load_all())
+    [cred] = asyncio.run(FileCredentialSource(path).loadAll())
 
     assert cred.matches("abc")
 
 
-def test_a_missing_credential_file_is_a_config_error(tmp_path) -> None:
+def testAMissingCredentialFileIsAConfigError(tmp_path) -> None:
     with pytest.raises(CredentialConfigError, match="Cannot read"):
-        asyncio.run(FileCredentialSource(tmp_path / "absent.json").load_all())
+        asyncio.run(FileCredentialSource(tmp_path / "absent.json").loadAll())
 
 
-def test_an_empty_credential_file_yields_an_empty_store(tmp_path) -> None:
+def testAnEmptyCredentialFileYieldsAnEmptyStore(tmp_path) -> None:
     path = tmp_path / "creds.json"
     path.write_text("", encoding="utf-8")
 
-    assert asyncio.run(FileCredentialSource(path).load_all()) == []
+    assert asyncio.run(FileCredentialSource(path).loadAll()) == []
 
 
-def test_a_named_file_wins_over_the_inline_blob(monkeypatch, tmp_path) -> None:
+def testANamedFileWinsOverTheInlineBlob(monkeypatch, tmp_path) -> None:
     monkeypatch.setenv(ENV_CREDENTIALS_FILE, str(tmp_path / "creds.json"))
 
-    assert isinstance(build_credential_source(), FileCredentialSource)
+    assert isinstance(buildCredentialSource(), FileCredentialSource)
 
 
-def test_the_inline_blob_is_the_fallback(monkeypatch) -> None:
+def testTheInlineBlobIsTheFallback(monkeypatch) -> None:
     monkeypatch.delenv(ENV_CREDENTIALS_FILE, raising=False)
 
-    assert isinstance(build_credential_source(), EnvCredentialSource)
+    assert isinstance(buildCredentialSource(), EnvCredentialSource)
 
 
-def test_local_stores_declare_themselves_static(tmp_path) -> None:
+def testLocalStoresDeclareThemselvesStatic(tmp_path) -> None:
     # Nothing else can change them mid-flight, so nothing should poll them.
-    assert FileCredentialSource(tmp_path / "creds.json").refresh_interval is None
-    assert EnvCredentialSource().refresh_interval is None
+    assert FileCredentialSource(tmp_path / "creds.json").refreshInterval is None
+    assert EnvCredentialSource().refreshInterval is None
 
 
 # --- verifying from memory ---------------------------------------------------
 
 
-def test_startup_loads_the_whole_store_into_memory() -> None:
+def testStartupLoadsTheWholeStoreIntoMemory() -> None:
     registry = ServerRegistry(FakeStore([credential()]))
 
-    assert asyncio.run(registry.load_all()) == 1
+    assert asyncio.run(registry.loadAll()) == 1
     assert len(registry) == 1
 
 
-def test_verification_never_touches_the_store() -> None:
+def testVerificationNeverTouchesTheStore() -> None:
     store = FakeStore([credential()])
     registry = ServerRegistry(store)
-    asyncio.run(registry.load_all())
+    asyncio.run(registry.loadAll())
 
     for _ in range(50):
         registry.authenticate("svc", "abc")
@@ -150,7 +150,7 @@ def test_verification_never_touches_the_store() -> None:
     assert store.reads == 1  # Only the startup load.
 
 
-def test_an_empty_registry_authenticates_nobody() -> None:
+def testAnEmptyRegistryAuthenticatesNobody() -> None:
     registry = ServerRegistry(FakeStore())
 
     with pytest.raises(AuthenticationError):
@@ -160,16 +160,16 @@ def test_an_empty_registry_authenticates_nobody() -> None:
 # --- what the refresh timer catches -----------------------------------------
 
 
-def test_a_revoked_server_stops_being_accepted() -> None:
+def testARevokedServerStopsBeingAccepted() -> None:
     store = FakeStore([credential()])
     registry = ServerRegistry(store)
 
     async def scenario() -> None:
-        await registry.load_all()
+        await registry.loadAll()
         registry.authenticate("svc", "abc")  # Works before revocation.
 
         store.remove("svc")  # Server decommissioned upstream.
-        await registry.load_all()  # What the timer does.
+        await registry.loadAll()  # What the timer does.
 
         with pytest.raises(AuthenticationError):
             registry.authenticate("svc", "abc")
@@ -177,14 +177,14 @@ def test_a_revoked_server_stops_being_accepted() -> None:
     asyncio.run(scenario())
 
 
-def test_a_rotated_secret_takes_effect() -> None:
+def testARotatedSecretTakesEffect() -> None:
     store = FakeStore([credential(secret="old")])
     registry = ServerRegistry(store)
 
     async def scenario() -> None:
-        await registry.load_all()
+        await registry.loadAll()
         store.put(credential(secret="new"))
-        await registry.load_all()
+        await registry.loadAll()
 
         registry.authenticate("svc", "new")
         with pytest.raises(AuthenticationError):
@@ -193,16 +193,16 @@ def test_a_rotated_secret_takes_effect() -> None:
     asyncio.run(scenario())
 
 
-def test_a_newly_issued_credential_is_picked_up() -> None:
+def testANewlyIssuedCredentialIsPickedUp() -> None:
     store = FakeStore()
     registry = ServerRegistry(store)
 
     async def scenario() -> None:
-        await registry.load_all()
+        await registry.loadAll()
         store.put(credential())
-        await registry.load_all()
+        await registry.loadAll()
 
-        assert registry.authenticate("svc", "abc").server_id == "svc"
+        assert registry.authenticate("svc", "abc").serverId == "svc"
 
     asyncio.run(scenario())
 
@@ -210,12 +210,12 @@ def test_a_newly_issued_credential_is_picked_up() -> None:
 # --- polling only when the store can change ----------------------------------
 
 
-def test_a_static_store_is_never_re_read() -> None:
-    store = FakeStore([credential()], refresh_interval=None)
+def testAStaticStoreIsNeverReRead() -> None:
+    store = FakeStore([credential()], refreshInterval=None)
     registry = ServerRegistry(store)
 
     async def scenario() -> None:
-        await registry.load_all()
+        await registry.loadAll()
         async with refreshing(registry):
             await asyncio.sleep(SETTLE)
 
@@ -224,12 +224,12 @@ def test_a_static_store_is_never_re_read() -> None:
     assert store.reads == 1  # The startup load, and nothing since.
 
 
-def test_a_shared_store_is_re_read_on_its_own_interval() -> None:
-    store = FakeStore([credential()], refresh_interval=TICK)
+def testASharedStoreIsReReadOnItsOwnInterval() -> None:
+    store = FakeStore([credential()], refreshInterval=TICK)
     registry = ServerRegistry(store)
 
     async def scenario() -> None:
-        await registry.load_all()
+        await registry.loadAll()
         async with refreshing(registry):
             await asyncio.sleep(SETTLE)
 
@@ -238,12 +238,12 @@ def test_a_shared_store_is_re_read_on_its_own_interval() -> None:
     assert store.reads > 2
 
 
-def test_the_refresh_loop_is_torn_down_with_the_app() -> None:
-    store = FakeStore([credential()], refresh_interval=TICK)
+def testTheRefreshLoopIsTornDownWithTheApp() -> None:
+    store = FakeStore([credential()], refreshInterval=TICK)
     registry = ServerRegistry(store)
 
     async def scenario() -> int:
-        await registry.load_all()
+        await registry.loadAll()
         async with refreshing(registry):
             await asyncio.sleep(SETTLE)
         settled = store.reads
@@ -256,13 +256,13 @@ def test_the_refresh_loop_is_torn_down_with_the_app() -> None:
 # --- the timer itself --------------------------------------------------------
 
 
-def test_the_poller_keeps_re_reading_the_store() -> None:
+def testThePollerKeepsReReadingTheStore() -> None:
     store = FakeStore([credential()])
     registry = ServerRegistry(store)
 
     async def scenario() -> None:
-        await registry.load_all()
-        poller = asyncio.create_task(registry.refresh_forever(interval=TICK))
+        await registry.loadAll()
+        poller = asyncio.create_task(registry.refreshForever(interval=TICK))
         await asyncio.sleep(SETTLE)
         poller.cancel()
 
@@ -271,29 +271,29 @@ def test_the_poller_keeps_re_reading_the_store() -> None:
     assert store.reads > 2
 
 
-def test_a_store_outage_leaves_the_cached_credentials_serving() -> None:
+def testAStoreOutageLeavesTheCachedCredentialsServing() -> None:
     store = FakeStore([credential()])
     registry = ServerRegistry(store)
 
     async def scenario() -> None:
-        await registry.load_all()
+        await registry.loadAll()
         store.down = True
-        poller = asyncio.create_task(registry.refresh_forever(interval=TICK))
+        poller = asyncio.create_task(registry.refreshForever(interval=TICK))
         await asyncio.sleep(SETTLE)
         poller.cancel()
 
     asyncio.run(scenario())
 
-    assert registry.authenticate("svc", "abc").server_id == "svc"
+    assert registry.authenticate("svc", "abc").serverId == "svc"
 
 
-def test_the_poller_survives_an_outage_and_catches_up_afterwards() -> None:
+def testThePollerSurvivesAnOutageAndCatchesUpAfterwards() -> None:
     store = FakeStore([credential()])
     registry = ServerRegistry(store)
 
     async def scenario() -> None:
-        await registry.load_all()
-        poller = asyncio.create_task(registry.refresh_forever(interval=TICK))
+        await registry.loadAll()
+        poller = asyncio.create_task(registry.refreshForever(interval=TICK))
 
         store.down = True
         await asyncio.sleep(SETTLE)

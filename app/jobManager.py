@@ -2,7 +2,7 @@
 
 This is what the API layer talks to: create a job, look one up by id, shut
 down cleanly. Running a single job -- the queued/processing/done/failed
-mechanics -- is ``app.jobs.run_job``; this module decides *when* that runs,
+mechanics -- is ``app.jobs.runJob``; this module decides *when* that runs,
 keeps the result reachable, and is what routes.py depends on.
 """
 
@@ -10,7 +10,7 @@ import asyncio
 import logging
 
 from app.documents import DocumentAnalyzerProcessor, DocumentProcessor
-from app.jobs import Job, run_job
+from app.jobs import Job, runJob
 
 logger = logging.getLogger(__name__)
 
@@ -21,7 +21,7 @@ class JobManager:
     Jobs do not survive a restart -- there is no persistence layer. Fine for a
     single node; revisit if a queued job needs to survive a deploy.
 
-    A job's id is its ``ragDbId`` (see ``Job.job_id``), so submitting a second
+    A job's id is its ``ragDbId`` (see ``Job.jobId``), so submitting a second
     document for a ragDbId that already has a job reuses that id and replaces
     the previous record here. The task behind the replaced job is *not*
     cancelled -- it keeps running to completion (or failure), updating a Job
@@ -38,12 +38,12 @@ class JobManager:
     def __len__(self) -> int:
         return len(self._jobs)
 
-    def create(self, *, server_id: str, document_link: str, rag_db_id: str) -> Job:
-        """Record a queued job under ``rag_db_id`` and run it in the background."""
-        job = Job(job_id=rag_db_id, server_id=server_id, document_link=document_link)
-        self._jobs[job.job_id] = job
+    def create(self, *, serverId: str, documentLink: str, ragDbId: str) -> Job:
+        """Record a queued job under ``ragDbId`` and run it in the background."""
+        job = Job(jobId=ragDbId, serverId=serverId, documentLink=documentLink)
+        self._jobs[job.jobId] = job
 
-        task = asyncio.create_task(run_job(job, self._processor))
+        task = asyncio.create_task(runJob(job, self._processor))
         # Hold a reference so the task can't be garbage-collected mid-flight,
         # and drop it on completion so the set doesn't grow without bound.
         self._tasks.add(task)
@@ -51,8 +51,8 @@ class JobManager:
 
         return job
 
-    def get(self, job_id: str) -> Job | None:
-        return self._jobs.get(job_id)
+    def get(self, jobId: str) -> Job | None:
+        return self._jobs.get(jobId)
 
     async def shutdown(self) -> None:
         """Wait for every in-flight job to finish. Called when the app shuts down.
@@ -73,6 +73,6 @@ class JobManager:
 JOB_MANAGER = JobManager(DocumentAnalyzerProcessor())
 
 
-def get_job_manager() -> JobManager:
+def getJobManager() -> JobManager:
     """FastAPI dependency: the process-wide job manager."""
     return JOB_MANAGER

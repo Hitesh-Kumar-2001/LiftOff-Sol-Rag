@@ -1,9 +1,9 @@
 """A job's data, and the mechanics of running one.
 
-A ``Job`` is just a record -- id, status, timestamps. ``run_job`` is the one
+A ``Job`` is just a record -- id, status, timestamps. ``runJob`` is the one
 function that knows how to execute it: hand it to a processor, translate the
 outcome into a status. Deciding when a job runs, keeping it reachable by id,
-and returning it to the API is ``app.job_manager.JobManager``'s job, not this
+and returning it to the API is ``app.jobManager.JobManager``'s job, not this
 module's -- this module only knows how to run one, given one.
 """
 
@@ -38,19 +38,19 @@ class Job:
     # Deliberately the ragDbId being ingested into, not a generated id -- a
     # job exists to populate one RAG database, so there is nothing else
     # meaningful to key it by. See JobManager.create.
-    job_id: str
-    server_id: str
-    document_link: str
+    jobId: str
+    serverId: str
+    documentLink: str
     status: JobStatus = JobStatus.QUEUED
     detail: str | None = None
     # Set by DocumentAnalyzerProcessor once the download is analyzed. None
     # until then, and for processors (like the stub) that don't produce it.
     metadata: "DocumentMetadata | None" = None
-    created_at: datetime = field(default_factory=_now)
-    updated_at: datetime = field(default_factory=_now)
+    createdAt: datetime = field(default_factory=_now)
+    updatedAt: datetime = field(default_factory=_now)
 
 
-async def run_job(job: Job, processor: "DocumentProcessor") -> None:
+async def runJob(job: Job, processor: "DocumentProcessor") -> None:
     """Execute ``job`` against ``processor``, updating its status as it goes.
 
     A processor failure is caught and recorded on the job rather than raised,
@@ -58,15 +58,15 @@ async def run_job(job: Job, processor: "DocumentProcessor") -> None:
     exception surface from that task.
     """
     job.status = JobStatus.PROCESSING
-    job.updated_at = _now()
+    job.updatedAt = _now()
     try:
         await processor.process(job)
     except asyncio.CancelledError:
         raise
     except Exception as exc:
-        logger.exception("Job %s failed.", job.job_id)
+        logger.exception("Job %s failed.", job.jobId)
         job.status = JobStatus.FAILED
         job.detail = str(exc)
     else:
         job.status = JobStatus.DONE
-    job.updated_at = _now()
+    job.updatedAt = _now()

@@ -4,7 +4,7 @@ from typing import Annotated
 
 from fastapi import APIRouter, Depends, HTTPException, status
 
-from app.job_manager import JobManager, get_job_manager
+from app.jobManager import JobManager, getJobManager
 from app.schemas import (
     DocumentIngestRequest,
     ErrorResponse,
@@ -12,15 +12,15 @@ from app.schemas import (
     QueryRequest,
     QueryResponse,
 )
-from app.security import AuthenticationError, ServerRegistry, get_server_registry
+from app.security import AuthenticationError, ServerRegistry, getServerRegistry
 
 router = APIRouter(prefix="/api/v1")
 
 
-def _require_server(registry: ServerRegistry, server_id: str, server_secret: str) -> None:
+def _requireServer(registry: ServerRegistry, serverId: str, serverSecret: str) -> None:
     """Raise the shared 401 if the caller cannot be verified."""
     try:
-        registry.authenticate(server_id, server_secret)
+        registry.authenticate(serverId, serverSecret)
     except AuthenticationError:
         # Deliberately vague: do not reveal which half of the pair was wrong.
         raise HTTPException(
@@ -40,10 +40,10 @@ def _require_server(registry: ServerRegistry, server_id: str, server_secret: str
 )
 async def query(
     payload: QueryRequest,
-    registry: Annotated[ServerRegistry, Depends(get_server_registry)],
+    registry: Annotated[ServerRegistry, Depends(getServerRegistry)],
 ) -> QueryResponse:
     """Verify the calling server, then answer its question from one database."""
-    _require_server(registry, payload.server_id, payload.server_secret.get_secret_value())
+    _requireServer(registry, payload.server_id, payload.server_secret.get_secret_value())
 
     # TODO: hand (rag_db_id, question) to the retrieval layer once it exists.
     return QueryResponse(
@@ -62,10 +62,10 @@ async def query(
         401: {"model": ErrorResponse, "description": "Unknown serverId or serverSecret"},
     },
 )
-async def submit_document(
+async def submitDocument(
     payload: DocumentIngestRequest,
-    registry: Annotated[ServerRegistry, Depends(get_server_registry)],
-    jobs: Annotated[JobManager, Depends(get_job_manager)],
+    registry: Annotated[ServerRegistry, Depends(getServerRegistry)],
+    jobs: Annotated[JobManager, Depends(getJobManager)],
 ) -> JobResponse:
     """Verify the calling server, queue the document, and return immediately.
 
@@ -76,11 +76,11 @@ async def submit_document(
     ``app.documents.DocumentProcessor``); the response only confirms the job
     was queued.
     """
-    _require_server(registry, payload.server_id, payload.server_secret.get_secret_value())
+    _requireServer(registry, payload.server_id, payload.server_secret.get_secret_value())
 
     job = jobs.create(
-        server_id=payload.server_id,
-        document_link=payload.document_link,
-        rag_db_id=payload.rag_db_id,
+        serverId=payload.server_id,
+        documentLink=payload.document_link,
+        ragDbId=payload.rag_db_id,
     )
-    return JobResponse(job_id=job.job_id, status=job.status.value)
+    return JobResponse(job_id=job.jobId, status=job.status.value)

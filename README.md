@@ -121,8 +121,8 @@ survives restarts if this matters for your deployment.
 | ---- | -------------- |
 | [app/main.py](app/main.py) | Builds the app; loads credentials at startup, keeps them fresh, and cancels in-flight jobs on shutdown |
 | [app/routes.py](app/routes.py) | The endpoints: verify the caller, then answer or queue |
-| [app/job_manager.py](app/job_manager.py) | What the API talks to for jobs — create, look up by id, shut down cleanly |
-| [app/jobs.py](app/jobs.py) | A job's data (`Job`, `JobStatus`) and `run_job`, which knows how to execute one |
+| [app/jobManager.py](app/jobManager.py) | What the API talks to for jobs — create, look up by id, shut down cleanly |
+| [app/jobs.py](app/jobs.py) | A job's data (`Job`, `JobStatus`) and `runJob`, which knows how to execute one |
 | [app/documents.py](app/documents.py) | The `DocumentProcessor` contract, plus the real (and stub) implementations |
 | [app/schemas.py](app/schemas.py) | The wire contract — camelCase JSON in and out, snake_case in Python |
 | [app/security.py](app/security.py) | Holds credentials in RAM and checks them |
@@ -170,9 +170,9 @@ rather than on the first request.
 ### Keeping the copy honest
 
 Whether the in-memory copy is re-read on a timer is the *store's* decision,
-declared as `refresh_interval`:
+declared as `refreshInterval`:
 
-| Store | `refresh_interval` | Why |
+| Store | `refreshInterval` | Why |
 | ----- | ------------------ | --- |
 | File, env var | `None` | Nothing else can change them while the node runs, so polling would re-read the same bytes forever. Edit and restart. |
 | Firestore, any shared DB | 30s | Another process can add, rotate, or revoke a credential at any moment. |
@@ -193,16 +193,16 @@ one attribute. A Firestore adapter is the whole of it:
 
 ```python
 class FirestoreCredentialSource:
-    refresh_interval = DEFAULT_REFRESH_INTERVAL_SECONDS  # shared: must be polled
+    refreshInterval = DEFAULT_REFRESH_INTERVAL_SECONDS  # shared: must be polled
 
-    async def load_all(self):
+    async def loadAll(self):
         return [
-            _to_credential(doc.id, doc.to_dict())
+            _toCredential(doc.id, doc.to_dict())
             async for doc in self._collection.stream()
         ]
 ```
 
-Return it from `build_credential_source()` and it starts being polled because it
+Return it from `buildCredentialSource()` and it starts being polled because it
 declares an interval. Nothing in `security.py`, `routes.py`, or `main.py`
 changes.
 

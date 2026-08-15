@@ -1,12 +1,12 @@
 """What a job does to a document, and the processor contract that defines it.
 
-``DocumentProcessor`` is what ``app.jobs.run_job`` executes; this module owns
+``DocumentProcessor`` is what ``app.jobs.runJob`` executes; this module owns
 that contract because the contract is about documents, not about how a job is
-scheduled or tracked (that's ``app.job_manager``). ``DocumentAnalyzerProcessor``
-is the real implementation: a job's ``document_link`` is downloaded, its format
+scheduled or tracked (that's ``app.jobManager``). ``DocumentAnalyzerProcessor``
+is the real implementation: a job's ``documentLink`` is downloaded, its format
 is detected, and metadata is pulled out of it. A ``.zip`` or ``.rar`` is
 unpacked and every supported member analyzed the same way, so its
-``DocumentMetadata.source_kind`` is ``"folder"``; anything else is ``"single"``.
+``DocumentMetadata.sourceKind`` is ``"folder"``; anything else is ``"single"``.
 
 Unlike zip, rar has no format-decoding logic in Python's standard library --
 ``rarfile`` shells out to an ``unrar`` (or ``bsdtar``/``7z``) binary that must
@@ -79,17 +79,17 @@ TOKEN_ENCODING_NAME = "cl100k_base"
 
 
 @lru_cache(maxsize=1)
-def _token_encoding() -> tiktoken.Encoding:
+def _tokenEncoding() -> tiktoken.Encoding:
     # tiktoken fetches this encoding's BPE data over the network the first
     # time any process asks for it, then caches the file on disk (by default
     # under the system temp dir, which may not survive a container restart).
     # A deployment with no outbound network on a cold start will hit this
-    # every time -- see _count_tokens, which degrades to `None` rather than
+    # every time -- see _countTokens, which degrades to `None` rather than
     # failing the whole file when that happens.
     return tiktoken.get_encoding(TOKEN_ENCODING_NAME)
 
 
-def _count_tokens(text: str) -> int | None:
+def _countTokens(text: str) -> int | None:
     """Best-effort token count for ``text``.
 
     Returns ``None`` -- not 0 -- if the tokenizer couldn't run, so a file the
@@ -101,7 +101,7 @@ def _count_tokens(text: str) -> int | None:
     if not text:
         return 0
     try:
-        return len(_token_encoding().encode(text))
+        return len(_tokenEncoding().encode(text))
     except Exception:
         logger.warning("Token counting unavailable.", exc_info=True)
         return None
@@ -126,18 +126,18 @@ class FileMetadata:
 
     filename: str
     extension: str
-    size_bytes: int
-    table_count: int = 0
-    image_count: int = 0
-    page_count: int | None = None  # PDF
-    word_count: int | None = None  # docx, txt, md
-    line_count: int | None = None  # txt, md
-    row_count: int | None = None  # csv
-    column_count: int | None = None  # csv
+    sizeBytes: int
+    tableCount: int = 0
+    imageCount: int = 0
+    pageCount: int | None = None  # PDF
+    wordCount: int | None = None  # docx, txt, md
+    lineCount: int | None = None  # txt, md
+    rowCount: int | None = None  # csv
+    columnCount: int | None = None  # csv
     # Tokens in the file's extracted text (cl100k_base). None if the
     # tokenizer couldn't run; not attempted at all for formats with no
     # meaningful text (currently: none -- every supported format has some).
-    token_count: int | None = None
+    tokenCount: int | None = None
     # Set instead of raising when one file (typically inside a zip) fails to
     # parse, so one bad member doesn't lose the metadata for the rest.
     error: str | None = None
@@ -147,29 +147,29 @@ class FileMetadata:
 class DocumentMetadata:
     """What we could tell about the thing that was downloaded.
 
-    ``page_count``/``image_count``/``table_count``/``token_count`` are totals
+    ``pageCount``/``imageCount``/``tableCount``/``tokenCount`` are totals
     across every file -- including files nested arbitrarily deep inside
     archives-within-archives, not just the top level. Per-file detail is
     still in ``files``; these are the roll-up most callers actually want.
     """
 
-    source_url: str
-    source_kind: str  # "single" | "folder"
-    content_type: str | None
-    file_count: int
-    total_size_bytes: int
-    page_count: int
-    image_count: int
-    table_count: int
-    token_count: int
+    sourceUrl: str
+    sourceKind: str  # "single" | "folder"
+    contentType: str | None
+    fileCount: int
+    totalSizeBytes: int
+    pageCount: int
+    imageCount: int
+    tableCount: int
+    tokenCount: int
     files: list[FileMetadata] = field(default_factory=list)
 
 
-def _extension_of(name: str) -> str:
+def _extensionOf(name: str) -> str:
     return PurePosixPath(name).suffix.lower()
 
 
-def _filename_from_url(url: str) -> str:
+def _filenameFromUrl(url: str) -> str:
     name = PurePosixPath(urlparse(url).path).name
     return name or "document"
 
@@ -188,34 +188,34 @@ async def download(url: str) -> tuple[bytes, str, str | None]:
                         raise DownloadError(
                             f"Document exceeds the {MAX_DOWNLOAD_BYTES // (1024 * 1024)}MB limit."
                         )
-                content_type = response.headers.get("content-type")
+                contentType = response.headers.get("content-type")
     except httpx.HTTPError as exc:
         raise DownloadError(f"Could not download '{url}': {exc}") from exc
 
-    return bytes(body), _filename_from_url(url), content_type
+    return bytes(body), _filenameFromUrl(url), contentType
 
 
-def _resolve_extension(filename: str, content_type: str | None) -> str:
-    extension = _extension_of(filename)
+def _resolveExtension(filename: str, contentType: str | None) -> str:
+    extension = _extensionOf(filename)
     if extension in SUPPORTED_EXTENSIONS or extension in ARCHIVE_EXTENSIONS:
         return extension
 
-    if content_type:
-        mime = content_type.split(";")[0].strip().lower()
+    if contentType:
+        mime = contentType.split(";")[0].strip().lower()
         if mime in CONTENT_TYPE_EXTENSIONS:
             return CONTENT_TYPE_EXTENSIONS[mime]
 
     return extension  # Unrecognized either way; caller raises.
 
 
-def analyze_bytes(filename: str, data: bytes, *, extension: str | None = None) -> FileMetadata:
+def analyzeBytes(filename: str, data: bytes, *, extension: str | None = None) -> FileMetadata:
     """Extract metadata from one file's contents.
 
     A parse failure is recorded on ``FileMetadata.error`` rather than raised,
     so analyzing a zip full of files doesn't abort on the first bad one.
     """
-    extension = extension if extension is not None else _extension_of(filename)
-    meta = FileMetadata(filename=filename, extension=extension, size_bytes=len(data))
+    extension = extension if extension is not None else _extensionOf(filename)
+    meta = FileMetadata(filename=filename, extension=extension, sizeBytes=len(data))
 
     if extension not in SUPPORTED_EXTENSIONS:
         meta.error = f"Unsupported file type '{extension or filename}'."
@@ -223,13 +223,13 @@ def analyze_bytes(filename: str, data: bytes, *, extension: str | None = None) -
 
     try:
         if extension == ".pdf":
-            _analyze_pdf(data, meta)
+            _analyzePdf(data, meta)
         elif extension == ".docx":
-            _analyze_docx(data, meta)
+            _analyzeDocx(data, meta)
         elif extension == ".csv":
-            _analyze_csv(data, meta)
+            _analyzeCsv(data, meta)
         else:  # .txt, .md
-            _analyze_text(data, meta)
+            _analyzeText(data, meta)
     except Exception as exc:
         logger.warning("Failed to analyze '%s': %s", filename, exc)
         meta.error = str(exc)
@@ -237,40 +237,40 @@ def analyze_bytes(filename: str, data: bytes, *, extension: str | None = None) -
     return meta
 
 
-def _analyze_pdf(data: bytes, meta: FileMetadata) -> None:
+def _analyzePdf(data: bytes, meta: FileMetadata) -> None:
     with pdfplumber.open(io.BytesIO(data)) as pdf:
-        meta.page_count = len(pdf.pages)
-        page_texts = []
+        meta.pageCount = len(pdf.pages)
+        pageTexts = []
         for page in pdf.pages:
-            meta.table_count += len(page.find_tables())
-            meta.image_count += len(page.images)
-            page_texts.append(page.extract_text() or "")
-    meta.token_count = _count_tokens("\n".join(page_texts))
+            meta.tableCount += len(page.find_tables())
+            meta.imageCount += len(page.images)
+            pageTexts.append(page.extract_text() or "")
+    meta.tokenCount = _countTokens("\n".join(pageTexts))
 
 
-def _analyze_docx(data: bytes, meta: FileMetadata) -> None:
+def _analyzeDocx(data: bytes, meta: FileMetadata) -> None:
     document = docx.Document(io.BytesIO(data))
-    meta.table_count = len(document.tables)
-    meta.image_count = sum(1 for rel in document.part.rels.values() if "image" in rel.reltype)
+    meta.tableCount = len(document.tables)
+    meta.imageCount = sum(1 for rel in document.part.rels.values() if "image" in rel.reltype)
     text = "\n".join(paragraph.text for paragraph in document.paragraphs)
-    meta.word_count = len(text.split())
-    meta.token_count = _count_tokens(text)
+    meta.wordCount = len(text.split())
+    meta.tokenCount = _countTokens(text)
 
 
-def _analyze_csv(data: bytes, meta: FileMetadata) -> None:
+def _analyzeCsv(data: bytes, meta: FileMetadata) -> None:
     text = data.decode("utf-8-sig", errors="replace")
     rows = list(csv.reader(io.StringIO(text)))
-    meta.row_count = len(rows)
-    meta.column_count = len(rows[0]) if rows else 0
-    meta.table_count = 1 if rows else 0
-    meta.token_count = _count_tokens(text)
+    meta.rowCount = len(rows)
+    meta.columnCount = len(rows[0]) if rows else 0
+    meta.tableCount = 1 if rows else 0
+    meta.tokenCount = _countTokens(text)
 
 
-def _analyze_text(data: bytes, meta: FileMetadata) -> None:
+def _analyzeText(data: bytes, meta: FileMetadata) -> None:
     text = data.decode("utf-8", errors="replace")
-    meta.line_count = text.count("\n") + (1 if text and not text.endswith("\n") else 0)
-    meta.word_count = len(text.split())
-    meta.token_count = _count_tokens(text)
+    meta.lineCount = text.count("\n") + (1 if text and not text.endswith("\n") else 0)
+    meta.wordCount = len(text.split())
+    meta.tokenCount = _countTokens(text)
 
 
 # How many archive levels to unpack before giving up. Guards against a
@@ -280,7 +280,7 @@ def _analyze_text(data: bytes, meta: FileMetadata) -> None:
 MAX_ARCHIVE_DEPTH = 1
 
 
-def _open_archive(extension: str, data: bytes):
+def _openArchive(extension: str, data: bytes):
     """Open a zip or rar so its members can be listed and read.
 
     ``zipfile.ZipFile`` and ``rarfile.RarFile`` expose the same
@@ -292,8 +292,8 @@ def _open_archive(extension: str, data: bytes):
     return rarfile.RarFile(io.BytesIO(data))
 
 
-def _analyze_archive_entries(
-    extension: str, data: bytes, *, path_prefix: str, depth: int
+def _analyzeArchiveEntries(
+    extension: str, data: bytes, *, pathPrefix: str, depth: int
 ) -> list[FileMetadata]:
     """Walk one archive, recursing into any member that is itself a zip/rar.
 
@@ -304,16 +304,16 @@ def _analyze_archive_entries(
     if depth > MAX_ARCHIVE_DEPTH:
         return [
             FileMetadata(
-                filename=path_prefix.rstrip("/"),
+                filename=pathPrefix.rstrip("/"),
                 extension=extension,
-                size_bytes=len(data),
+                sizeBytes=len(data),
                 error=f"Archive nesting exceeds the {MAX_ARCHIVE_DEPTH}-level limit.",
             )
         ]
 
     files: list[FileMetadata] = []
     try:
-        with _open_archive(extension, data) as archive:
+        with _openArchive(extension, data) as archive:
             for info in archive.infolist():
                 name = PurePosixPath(info.filename).name
                 # Skip directory entries and junk archives love to carry
@@ -322,21 +322,21 @@ def _analyze_archive_entries(
                 if info.is_dir() or not name or name.startswith("."):
                     continue
 
-                member_path = f"{path_prefix}{info.filename}"
-                member_extension = _extension_of(name)
-                member_bytes = archive.read(info)
+                memberPath = f"{pathPrefix}{info.filename}"
+                memberExtension = _extensionOf(name)
+                memberBytes = archive.read(info)
 
-                if member_extension in ARCHIVE_EXTENSIONS:
+                if memberExtension in ARCHIVE_EXTENSIONS:
                     files.extend(
-                        _analyze_archive_entries(
-                            member_extension,
-                            member_bytes,
-                            path_prefix=f"{member_path}/",
+                        _analyzeArchiveEntries(
+                            memberExtension,
+                            memberBytes,
+                            pathPrefix=f"{memberPath}/",
                             depth=depth + 1,
                         )
                     )
                 else:
-                    files.append(analyze_bytes(member_path, member_bytes))
+                    files.append(analyzeBytes(memberPath, memberBytes))
     except rarfile.RarExecError as exc:
         # Listing a rar's contents needs no external tool; reading a member's
         # bytes does. That means this can fail partway through the walk --
@@ -350,51 +350,51 @@ def _analyze_archive_entries(
     return files
 
 
-def _analyze_archive(
-    url: str, extension: str, data: bytes, content_type: str | None
+def _analyzeArchive(
+    url: str, extension: str, data: bytes, contentType: str | None
 ) -> DocumentMetadata:
-    files = _analyze_archive_entries(extension, data, path_prefix="", depth=0)
+    files = _analyzeArchiveEntries(extension, data, pathPrefix="", depth=0)
 
     return DocumentMetadata(
-        source_url=url,
-        source_kind="folder",
-        content_type=content_type,
-        file_count=len(files),
-        total_size_bytes=sum(f.size_bytes for f in files),
-        page_count=sum(f.page_count or 0 for f in files),
-        image_count=sum(f.image_count for f in files),
-        table_count=sum(f.table_count for f in files),
-        token_count=sum(f.token_count or 0 for f in files),
+        sourceUrl=url,
+        sourceKind="folder",
+        contentType=contentType,
+        fileCount=len(files),
+        totalSizeBytes=sum(f.sizeBytes for f in files),
+        pageCount=sum(f.pageCount or 0 for f in files),
+        imageCount=sum(f.imageCount for f in files),
+        tableCount=sum(f.tableCount for f in files),
+        tokenCount=sum(f.tokenCount or 0 for f in files),
         files=files,
     )
 
 
-def analyze(url: str, filename: str, data: bytes, content_type: str | None = None) -> DocumentMetadata:
+def analyze(url: str, filename: str, data: bytes, contentType: str | None = None) -> DocumentMetadata:
     """Analyze a downloaded document. A zip or rar becomes a folder of files;
     anything else is a single file."""
-    extension = _resolve_extension(filename, content_type)
+    extension = _resolveExtension(filename, contentType)
 
     if extension in ARCHIVE_EXTENSIONS:
-        return _analyze_archive(url, extension, data, content_type)
+        return _analyzeArchive(url, extension, data, contentType)
 
     if extension not in SUPPORTED_EXTENSIONS:
         raise UnsupportedDocumentError(
             f"Unsupported document type for '{filename}' "
-            f"(content-type: {content_type or 'unknown'})."
+            f"(content-type: {contentType or 'unknown'})."
         )
 
-    file_meta = analyze_bytes(filename, data, extension=extension)
+    fileMeta = analyzeBytes(filename, data, extension=extension)
     return DocumentMetadata(
-        source_url=url,
-        source_kind="single",
-        content_type=content_type,
-        file_count=1,
-        total_size_bytes=file_meta.size_bytes,
-        page_count=file_meta.page_count or 0,
-        image_count=file_meta.image_count,
-        table_count=file_meta.table_count,
-        token_count=file_meta.token_count or 0,
-        files=[file_meta],
+        sourceUrl=url,
+        sourceKind="single",
+        contentType=contentType,
+        fileCount=1,
+        totalSizeBytes=fileMeta.sizeBytes,
+        pageCount=fileMeta.pageCount or 0,
+        imageCount=fileMeta.imageCount,
+        tableCount=fileMeta.tableCount,
+        tokenCount=fileMeta.tokenCount or 0,
+        files=[fileMeta],
     )
 
 
@@ -403,7 +403,7 @@ class DocumentProcessor(Protocol):
 
     Whatever an implementation does -- fetch the link, chunk it, embed it,
     write it to a ragDbId -- it should raise on failure and otherwise mutate
-    nothing but ``job.detail`` / ``job.metadata``; ``app.jobs.run_job`` owns
+    nothing but ``job.detail`` / ``job.metadata``; ``app.jobs.runJob`` owns
     ``job.status``.
     """
 
@@ -418,21 +418,21 @@ class StubDocumentProcessor:
 
 
 class DocumentAnalyzerProcessor:
-    """Downloads ``job.document_link``, analyzes it, and records the result.
+    """Downloads ``job.documentLink``, analyzes it, and records the result.
 
     Any exception here -- a bad URL, an unsupported type, a network failure --
-    is left to propagate; ``app.jobs.run_job`` is what catches it and marks
+    is left to propagate; ``app.jobs.runJob`` is what catches it and marks
     the job failed.
     """
 
     async def process(self, job: "Job") -> None:
-        data, filename, content_type = await download(job.document_link)
-        metadata = analyze(job.document_link, filename, data, content_type)
+        data, filename, contentType = await download(job.documentLink)
+        metadata = analyze(job.documentLink, filename, data, contentType)
 
         job.metadata = metadata
         job.detail = (
-            f"Analyzed {metadata.file_count} file(s) "
-            f"({metadata.source_kind}, {metadata.total_size_bytes} bytes) -- "
-            f"{metadata.page_count} page(s), {metadata.image_count} image(s), "
-            f"{metadata.table_count} table(s), {metadata.token_count} token(s)."
+            f"Analyzed {metadata.fileCount} file(s) "
+            f"({metadata.sourceKind}, {metadata.totalSizeBytes} bytes) -- "
+            f"{metadata.pageCount} page(s), {metadata.imageCount} image(s), "
+            f"{metadata.tableCount} table(s), {metadata.tokenCount} token(s)."
         )

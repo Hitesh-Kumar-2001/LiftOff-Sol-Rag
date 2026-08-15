@@ -4,9 +4,9 @@ from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
 
-from app.job_manager import get_job_manager
+from app.jobManager import getJobManager
 from app.routes import router
-from app.security import get_server_registry, refreshing
+from app.security import getServerRegistry, refreshing
 
 logger = logging.getLogger(__name__)
 
@@ -15,13 +15,13 @@ logger = logging.getLogger(__name__)
 async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     # Resolved the same way the route resolves it, so startup can never fill one
     # registry while requests read another.
-    registry = get_server_registry()
+    registry = getServerRegistry()
 
     # Fill memory before the first request lands. Failing here is deliberate: a
     # process that cannot read the credential store should not accept traffic.
-    logger.info("Loaded %d server credentials.", await registry.load_all())
+    logger.info("Loaded %d server credentials.", await registry.loadAll())
 
-    jobs = get_job_manager()
+    jobs = getJobManager()
     try:
         async with refreshing(registry):
             yield

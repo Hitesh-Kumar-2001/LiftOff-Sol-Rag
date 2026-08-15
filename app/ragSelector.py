@@ -11,14 +11,14 @@ class RagSelector:
     def __init__(self) -> None:
         pass
 
-    def suggest(self, document_metadata: Any) -> str:
+    def suggest(self, documentMetadata: Any) -> str:
         """Return the name/identifier of the suggested RAG implementation."""
         raise NotImplementedError
 
-    def _score(self, document_metadata: Any) -> Any:
+    def _score(self, documentMetadata: Any) -> Any:
         """Placeholder for future per-implementation scoring logic."""
         raise NotImplementedError
 
-    def _available_implementations(self) -> list[str]:
+    def _availableImplementations(self) -> list[str]:
         """Placeholder for the future registry of selectable implementations."""
         raise NotImplementedError
