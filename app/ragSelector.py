@@ -1,24 +1,63 @@
-"""Placeholder structure only -- no implementation yet."""
+"""Picks a chunking strategy from a document's total token count.
 
-from typing import Any
+Single-choice per size band today; ``availableImplementations`` is where a
+real registry -- multiple RAG backends to weigh against each other -- will
+grow into once there's more than one option per band.
+"""
+
+from __future__ import annotations
+
+import logging
+from typing import TYPE_CHECKING
+
+from app.ragIngestionPipeline import ChunkingStrategy
+
+if TYPE_CHECKING:
+    # Only needed for the type hint below -- importing it for real would make
+    # app.documents and app.ragSelector import each other.
+    from app.documents import DocumentMetadata
+
+logger = logging.getLogger(__name__)
+
+# Token-count bands (inclusive lower bound):
+#   < RAW_MAX_TOKENS                         -> RAW    (too small to bother chunking)
+#   [RAW_MAX_TOKENS, NON_AI_MAX_TOKENS)       -> NON_AI (simple vector segmentation)
+#   [NON_AI_MAX_TOKENS, AI_LOG_THRESHOLD)     -> AI
+#   >= AI_LOG_THRESHOLD                       -> AI, logged (unusually large)
+RAW_MAX_TOKENS = 2000
+NON_AI_MAX_TOKENS = 10000
+AI_LOG_THRESHOLD_TOKENS = 100000
 
 
 class RagSelector:
-    """Suggests a RAG implementation for a document. Single-choice for now;
+    """Suggests a chunking strategy for a document. Single-choice for now;
     will be modularized into a registry of selectable implementations later.
     """
 
-    def __init__(self) -> None:
-        pass
+    def suggest(self, documentMetadata: "DocumentMetadata") -> ChunkingStrategy:
+        """Return the chunking strategy to ingest ``documentMetadata`` with."""
+        return self.score(documentMetadata)
 
-    def suggest(self, documentMetadata: Any) -> str:
-        """Return the name/identifier of the suggested RAG implementation."""
-        raise NotImplementedError
+    def score(self, documentMetadata: "DocumentMetadata") -> ChunkingStrategy:
+        tokenCount = documentMetadata.tokenCount
 
-    def _score(self, documentMetadata: Any) -> Any:
-        """Placeholder for future per-implementation scoring logic."""
-        raise NotImplementedError
+        if tokenCount < RAW_MAX_TOKENS:
+            return ChunkingStrategy.RAW
 
-    def _availableImplementations(self) -> list[str]:
+        if tokenCount < NON_AI_MAX_TOKENS:
+            return ChunkingStrategy.NON_AI
+
+        if tokenCount >= AI_LOG_THRESHOLD_TOKENS:
+            logger.warning(
+                "Document '%s' has %d tokens (>= %d) -- unusually large; "
+                "using AI chunking anyway.",
+                documentMetadata.sourceUrl,
+                tokenCount,
+                AI_LOG_THRESHOLD_TOKENS,
+            )
+
+        return ChunkingStrategy.AI
+
+    def availableImplementations(self) -> list[ChunkingStrategy]:
         """Placeholder for the future registry of selectable implementations."""
-        raise NotImplementedError
+        return list(ChunkingStrategy)

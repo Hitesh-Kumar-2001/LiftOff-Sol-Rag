@@ -9,8 +9,9 @@ keeps the result reachable, and is what routes.py depends on.
 import asyncio
 import logging
 
-from app.documents import DocumentAnalyzerProcessor, DocumentProcessor
+from app.documents import DocumentProcessor
 from app.jobs import Job, runJob
+from app.ragProcessor import RagIngestionProcessor
 
 logger = logging.getLogger(__name__)
 
@@ -70,7 +71,7 @@ class JobManager:
 
 
 # One manager for the life of the process, same pattern as SERVER_REGISTRY.
-JOB_MANAGER = JobManager(DocumentAnalyzerProcessor())
+JOB_MANAGER = JobManager(RagIngestionProcessor())
 
 
 def getJobManager() -> JobManager:

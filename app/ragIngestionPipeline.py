@@ -1,0 +1,255 @@
+"""Load -> split -> chunk -> store.
+
+The loader here reads plain text over http(s) or from a local path; it does
+not (yet) share app.documents.download, which already handles PDFs/docx/csv/
+archives -- a document downloaded there for metadata still gets re-fetched
+here as raw text, so a PDF's bytes are not usefully chunked yet.
+
+Chunks are stored under a caller-supplied ``ragDbId`` -- the id of the RAG
+database being populated, not the source URL -- so re-ingesting a different
+document into the same ``ragDbId`` overwrites what's there, same as a job
+resubmission under an existing ``ragDbId`` (see ``app.jobManager``).
+"""
+
+from __future__ import annotations
+
+import json
+import logging
+import os
+import re
+from dataclasses import dataclass, field
+from enum import Enum, auto
+from functools import lru_cache
+from pathlib import Path
+from typing import Protocol
+from urllib.parse import urlparse
+
+import httpx
+import tiktoken
+from google import genai
+
+logger = logging.getLogger(__name__)
+
+ENV_GEMINI_API_KEY = "GEMINI_API_KEY"
+# Flash-lite: the cheapest tier, and picking chunk boundaries does not need
+# more. Pinned rather than `gemini-flash-latest` so a model retirement or a
+# behaviour change is something we opt into -- gemini-2.0-flash was the
+# default here until Google retired it out from under this code.
+GEMINI_MODEL = os.environ.get("RAG_GEMINI_MODEL", "gemini-3.5-flash-lite")
+
+DOWNLOAD_TIMEOUT_SECONDS = 60.0
+TOKEN_ENCODING_NAME = "cl100k_base"
+
+DEFAULT_CHUNK_TOKENS = 400
+DEFAULT_CHUNK_OVERLAP_TOKENS = 40
+
+AI_CHUNK_PROMPT = (
+    "Split the TEXT below into self-contained semantic chunks. Each chunk "
+    "should cover one coherent idea and be no more than {maxTokens} tokens. "
+    "Respond with ONLY a JSON array of strings (one chunk per string) -- no "
+    "markdown fences, no other text.\n\nTEXT:\n{text}"
+)
+
+
+class IngestionError(Exception):
+    """The document could not be loaded, chunked, or stored."""
+
+
+class ChunkingStrategy(Enum):
+    RAW = auto()  # store the whole document as one chunk, no splitting
+    NON_AI = auto()  # fixed-size token windows with overlap
+    AI = auto()  # Gemini Flash decides chunk boundaries
+
+
+@dataclass
+class Chunk:
+    text: str
+    index: int
+    tokenCount: int
+
+
+@dataclass
+class IngestedDocument:
+    ragDbId: str
+    sourceUrl: str
+    chunks: list[Chunk] = field(default_factory=list)
+
+
+@lru_cache(maxsize=1)
+def tokenEncoding() -> tiktoken.Encoding:
+    return tiktoken.get_encoding(TOKEN_ENCODING_NAME)
+
+
+def countTokens(text: str) -> int:
+    return len(tokenEncoding().encode(text)) if text else 0
+
+
+async def load(source: str) -> str:
+    """Fetch ``source`` as plain text -- an http(s) URL or a local file path."""
+    if urlparse(source).scheme in ("http", "https"):
+        return await loadFromUrl(source)
+    return loadFromFile(source)
+
+
+async def loadFromUrl(url: str) -> str:
+    try:
+        async with httpx.AsyncClient(follow_redirects=True, timeout=DOWNLOAD_TIMEOUT_SECONDS) as client:
+            response = await client.get(url)
+            response.raise_for_status()
+    except httpx.HTTPError as exc:
+        raise IngestionError(f"Could not download '{url}': {exc}") from exc
+    return response.text
+
+
+def loadFromFile(path: str) -> str:
+    try:
+        return Path(path).read_text(encoding="utf-8")
+    except OSError as exc:
+        raise IngestionError(f"Could not read '{path}': {exc}") from exc
+
+
+def split(text: str) -> list[str]:
+    """Split raw text into sections on blank lines (paragraph breaks)."""
+    sections = [s.strip() for s in re.split(r"\n\s*\n", text) if s.strip()]
+    if sections:
+        return sections
+    return [text.strip()] if text.strip() else []
+
+
+def chunkWithoutAi(
+    sections: list[str],
+    *,
+    chunkTokens: int = DEFAULT_CHUNK_TOKENS,
+    overlapTokens: int = DEFAULT_CHUNK_OVERLAP_TOKENS,
+) -> list[str]:
+    """Fixed-size token windows with overlap. No network calls, no cost."""
+    encoding = tokenEncoding()
+    chunks: list[str] = []
+    for section in sections:
+        tokens = encoding.encode(section)
+        start = 0
+        while start < len(tokens):
+            end = min(start + chunkTokens, len(tokens))
+            chunks.append(encoding.decode(tokens[start:end]))
+            if end == len(tokens):
+                break
+            start = end - overlapTokens
+    return chunks
+
+
+@lru_cache(maxsize=1)
+def geminiClient() -> genai.Client:
+    apiKey = os.environ.get(ENV_GEMINI_API_KEY)
+    if not apiKey:
+        raise IngestionError(f"{ENV_GEMINI_API_KEY} is not set.")
+    return genai.Client(api_key=apiKey)
+
+
+async def chunkWithAi(
+    sections: list[str],
+    *,
+    model: str = GEMINI_MODEL,
+    maxTokens: int = DEFAULT_CHUNK_TOKENS,
+) -> list[str]:
+    """Ask Gemini Flash to pick semantic chunk boundaries within each section."""
+    client = geminiClient()
+    chunks: list[str] = []
+    for section in sections:
+        prompt = AI_CHUNK_PROMPT.format(maxTokens=maxTokens, text=section)
+        try:
+            response = await client.aio.models.generate_content(model=model, contents=prompt)
+        except Exception as exc:
+            raise IngestionError(f"Gemini chunking failed: {exc}") from exc
+        chunks.extend(parseAiChunks(response.text))
+    return chunks
+
+
+def parseAiChunks(raw: str | None) -> list[str]:
+    text = (raw or "").strip()
+    if text.startswith("```"):
+        text = text.strip("`")
+        if "\n" in text:
+            firstLine, text = text.split("\n", 1)
+            if firstLine.strip().lower() not in ("", "json"):
+                text = firstLine + "\n" + text
+
+    try:
+        parsed = json.loads(text)
+    except json.JSONDecodeError as exc:
+        raise IngestionError(f"Gemini returned unparsable chunks: {exc}") from exc
+
+    if not isinstance(parsed, list) or not all(isinstance(item, str) for item in parsed):
+        raise IngestionError("Gemini did not return a JSON array of strings.")
+
+    return [item.strip() for item in parsed if item.strip()]
+
+
+class ChunkStore(Protocol):
+    """Where finished chunks end up, keyed by ``ragDbId``. In-memory for now;
+    a real DB slots in here later without the pipeline above needing to
+    change."""
+
+    async def save(self, ragDbId: str, chunks: list[Chunk]) -> None: ...
+
+    async def get(self, ragDbId: str) -> list[Chunk]: ...
+
+
+class InMemoryChunkStore:
+    def __init__(self) -> None:
+        self.byRagDbId: dict[str, list[Chunk]] = {}
+
+    async def save(self, ragDbId: str, chunks: list[Chunk]) -> None:
+        self.byRagDbId[ragDbId] = chunks
+
+    async def get(self, ragDbId: str) -> list[Chunk]:
+        return self.byRagDbId.get(ragDbId, [])
+
+
+class RagIngestionPipeline:
+    """load -> split -> chunk -> store."""
+
+    def __init__(self, store: ChunkStore | None = None) -> None:
+        self.store = store or InMemoryChunkStore()
+
+    async def run(
+        self,
+        source: str,
+        ragDbId: str,
+        strategy: ChunkingStrategy = ChunkingStrategy.NON_AI,
+    ) -> IngestedDocument:
+        """Load ``source``, then chunk and store it."""
+        text = await load(source)
+        return await self.runText(text, ragDbId, sourceUrl=source, strategy=strategy)
+
+    async def runText(
+        self,
+        text: str,
+        ragDbId: str,
+        *,
+        sourceUrl: str = "",
+        strategy: ChunkingStrategy = ChunkingStrategy.NON_AI,
+    ) -> IngestedDocument:
+        """Chunk and store text already in hand.
+
+        The entry point for a caller that has extracted the text itself --
+        ``load`` above only reads plain text, so anything that started as a
+        PDF, docx, or archive has to come through here.
+        """
+        texts = await self.chunk(text, strategy)
+
+        chunks = [
+            Chunk(text=chunkText, index=i, tokenCount=countTokens(chunkText))
+            for i, chunkText in enumerate(texts)
+        ]
+        await self.store.save(ragDbId, chunks)
+
+        return IngestedDocument(ragDbId=ragDbId, sourceUrl=sourceUrl, chunks=chunks)
+
+    async def chunk(self, text: str, strategy: ChunkingStrategy) -> list[str]:
+        if strategy is ChunkingStrategy.RAW:
+            return [text.strip()] if text.strip() else []
+
+        sections = split(text)
+        if strategy is ChunkingStrategy.AI:
+            return await chunkWithAi(sections)
+        return chunkWithoutAi(sections)

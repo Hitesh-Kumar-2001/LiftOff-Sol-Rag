@@ -398,6 +398,81 @@ def analyze(url: str, filename: str, data: bytes, contentType: str | None = None
     )
 
 
+def extractText(filename: str, data: bytes, contentType: str | None = None) -> str:
+    """The document's text, for callers that need the content rather than the
+    counts ``analyze`` produces (chunking, embedding).
+
+    Parses independently of ``analyze`` rather than sharing one pass: analyze
+    walks a PDF page by page for tables and images and keeps only totals, so
+    there is no extracted text left over to hand back. A document that is both
+    analyzed and chunked is therefore parsed twice -- cheap enough at these
+    sizes, and it keeps ``analyze``'s signature about metadata only.
+
+    An archive becomes every supported member's text concatenated, in the
+    order the archive lists them. A member that fails to parse is skipped with
+    a warning, the same tolerance ``analyzeBytes`` has.
+    """
+    extension = _resolveExtension(filename, contentType)
+
+    if extension in ARCHIVE_EXTENSIONS:
+        return _archiveText(extension, data, depth=0)
+
+    if extension not in SUPPORTED_EXTENSIONS:
+        raise UnsupportedDocumentError(
+            f"Cannot extract text from '{filename}' "
+            f"(content-type: {contentType or 'unknown'})."
+        )
+
+    return _textOf(extension, data)
+
+
+def _textOf(extension: str, data: bytes) -> str:
+    if extension == ".pdf":
+        with pdfplumber.open(io.BytesIO(data)) as pdf:
+            return "\n".join(page.extract_text() or "" for page in pdf.pages)
+
+    if extension == ".docx":
+        document = docx.Document(io.BytesIO(data))
+        return "\n".join(paragraph.text for paragraph in document.paragraphs)
+
+    if extension == ".csv":
+        return data.decode("utf-8-sig", errors="replace")
+
+    return data.decode("utf-8", errors="replace")  # .txt, .md
+
+
+def _archiveText(extension: str, data: bytes, *, depth: int) -> str:
+    if depth > MAX_ARCHIVE_DEPTH:
+        return ""
+
+    texts: list[str] = []
+    try:
+        with _openArchive(extension, data) as archive:
+            for info in archive.infolist():
+                name = PurePosixPath(info.filename).name
+                if info.is_dir() or not name or name.startswith("."):
+                    continue
+
+                memberExtension = _extensionOf(name)
+                memberBytes = archive.read(info)
+
+                if memberExtension in ARCHIVE_EXTENSIONS:
+                    texts.append(_archiveText(memberExtension, memberBytes, depth=depth + 1))
+                elif memberExtension in SUPPORTED_EXTENSIONS:
+                    try:
+                        texts.append(_textOf(memberExtension, memberBytes))
+                    except Exception as exc:
+                        logger.warning("Skipping '%s': %s", info.filename, exc)
+    except rarfile.RarExecError as exc:
+        raise ArchiveToolMissingError(
+            "Cannot read .rar archives: no unrar/bsdtar/7z tool found "
+            f"(looked for '{rarfile.UNRAR_TOOL}'). Install one, or point "
+            "RAG_UNRAR_TOOL at its path."
+        ) from exc
+
+    return "\n\n".join(text for text in texts if text.strip())
+
+
 class DocumentProcessor(Protocol):
     """The one thing a job needs done to it.
 
