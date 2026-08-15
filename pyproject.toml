@@ -9,6 +9,7 @@ dependencies = [
     "pdfplumber>=0.11.10",
     "python-docx>=1.2.0",
     "rarfile>=4.5",
+    "tiktoken>=0.13.0",
 ]
 
 [dependency-groups]

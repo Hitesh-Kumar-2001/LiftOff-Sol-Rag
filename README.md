@@ -100,7 +100,18 @@ archive is unpacked in turn, however many levels deep (capped at
 nested file's `filename` carries its full path, e.g.
 `outer.zip/inner.rar/doc.pdf`, so the origin stays visible even though the
 result is a flat list. `DocumentMetadata` also totals `pageCount`,
-`imageCount`, and `tableCount` across every file found, at every depth.
+`imageCount`, `tableCount`, and `tokenCount` across every file found, at every
+depth.
+
+Token counts use `tiktoken`'s `cl100k_base` encoding — a general-purpose proxy
+for "how much content is here" rather than a count tied to whichever model
+ends up doing embedding or generation. `tiktoken` fetches that encoding's data
+over the network the first time any process asks for it, then caches it on
+disk; a deployment with no outbound network on a cold start (or a wiped temp
+dir between restarts) will fail to count tokens until it succeeds once. That
+failure doesn't fail the file — `tokenCount` is `null` for that file rather
+than the whole analysis erroring out. Set `TIKTOKEN_CACHE_DIR` to a path that
+survives restarts if this matters for your deployment.
 
 ## How it works
 

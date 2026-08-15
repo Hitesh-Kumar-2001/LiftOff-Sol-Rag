@@ -27,6 +27,7 @@ import logging
 import os
 import zipfile
 from dataclasses import dataclass, field
+from functools import lru_cache
 from pathlib import PurePosixPath
 from typing import TYPE_CHECKING, Protocol
 from urllib.parse import urlparse
@@ -35,6 +36,7 @@ import docx
 import httpx
 import pdfplumber
 import rarfile
+import tiktoken
 
 # Where to find the unrar/bsdtar/7z binary rarfile shells out to. Not on every
 # machine by default the way zip support is -- override per-environment with
@@ -69,6 +71,41 @@ CONTENT_TYPE_EXTENSIONS = {
     "application/x-rar-compressed": ".rar",
 }
 
+# cl100k_base (GPT-3.5/GPT-4's encoding) is used as a general-purpose token
+# count, not tied to whichever model ends up doing embedding/generation --
+# it's a proxy for "roughly how much content is here", useful for chunking
+# decisions regardless of what reads the chunks later.
+TOKEN_ENCODING_NAME = "cl100k_base"
+
+
+@lru_cache(maxsize=1)
+def _token_encoding() -> tiktoken.Encoding:
+    # tiktoken fetches this encoding's BPE data over the network the first
+    # time any process asks for it, then caches the file on disk (by default
+    # under the system temp dir, which may not survive a container restart).
+    # A deployment with no outbound network on a cold start will hit this
+    # every time -- see _count_tokens, which degrades to `None` rather than
+    # failing the whole file when that happens.
+    return tiktoken.get_encoding(TOKEN_ENCODING_NAME)
+
+
+def _count_tokens(text: str) -> int | None:
+    """Best-effort token count for ``text``.
+
+    Returns ``None`` -- not 0 -- if the tokenizer couldn't run, so a file the
+    tokenizer failed on is distinguishable from a genuinely empty file.
+    ``lru_cache`` above doesn't cache exceptions, so a transient failure (e.g.
+    no network on first use) is retried on the next file rather than sticking
+    for the rest of the process.
+    """
+    if not text:
+        return 0
+    try:
+        return len(_token_encoding().encode(text))
+    except Exception:
+        logger.warning("Token counting unavailable.", exc_info=True)
+        return None
+
 
 class DownloadError(Exception):
     """The document could not be fetched."""
@@ -97,6 +134,10 @@ class FileMetadata:
     line_count: int | None = None  # txt, md
     row_count: int | None = None  # csv
     column_count: int | None = None  # csv
+    # Tokens in the file's extracted text (cl100k_base). None if the
+    # tokenizer couldn't run; not attempted at all for formats with no
+    # meaningful text (currently: none -- every supported format has some).
+    token_count: int | None = None
     # Set instead of raising when one file (typically inside a zip) fails to
     # parse, so one bad member doesn't lose the metadata for the rest.
     error: str | None = None
@@ -106,10 +147,10 @@ class FileMetadata:
 class DocumentMetadata:
     """What we could tell about the thing that was downloaded.
 
-    ``page_count``/``image_count``/``table_count`` are totals across every
-    file -- including files nested arbitrarily deep inside archives-within-
-    archives, not just the top level. Per-file detail is still in ``files``;
-    these are the roll-up most callers actually want.
+    ``page_count``/``image_count``/``table_count``/``token_count`` are totals
+    across every file -- including files nested arbitrarily deep inside
+    archives-within-archives, not just the top level. Per-file detail is
+    still in ``files``; these are the roll-up most callers actually want.
     """
 
     source_url: str
@@ -120,6 +161,7 @@ class DocumentMetadata:
     page_count: int
     image_count: int
     table_count: int
+    token_count: int
     files: list[FileMetadata] = field(default_factory=list)
 
 
@@ -198,34 +240,44 @@ def analyze_bytes(filename: str, data: bytes, *, extension: str | None = None) -
 def _analyze_pdf(data: bytes, meta: FileMetadata) -> None:
     with pdfplumber.open(io.BytesIO(data)) as pdf:
         meta.page_count = len(pdf.pages)
-        meta.table_count = sum(len(page.find_tables()) for page in pdf.pages)
-        meta.image_count = sum(len(page.images) for page in pdf.pages)
+        page_texts = []
+        for page in pdf.pages:
+            meta.table_count += len(page.find_tables())
+            meta.image_count += len(page.images)
+            page_texts.append(page.extract_text() or "")
+    meta.token_count = _count_tokens("\n".join(page_texts))
 
 
 def _analyze_docx(data: bytes, meta: FileMetadata) -> None:
     document = docx.Document(io.BytesIO(data))
     meta.table_count = len(document.tables)
     meta.image_count = sum(1 for rel in document.part.rels.values() if "image" in rel.reltype)
-    meta.word_count = sum(len(paragraph.text.split()) for paragraph in document.paragraphs)
+    text = "\n".join(paragraph.text for paragraph in document.paragraphs)
+    meta.word_count = len(text.split())
+    meta.token_count = _count_tokens(text)
 
 
 def _analyze_csv(data: bytes, meta: FileMetadata) -> None:
-    rows = list(csv.reader(io.StringIO(data.decode("utf-8-sig", errors="replace"))))
+    text = data.decode("utf-8-sig", errors="replace")
+    rows = list(csv.reader(io.StringIO(text)))
     meta.row_count = len(rows)
     meta.column_count = len(rows[0]) if rows else 0
     meta.table_count = 1 if rows else 0
+    meta.token_count = _count_tokens(text)
 
 
 def _analyze_text(data: bytes, meta: FileMetadata) -> None:
     text = data.decode("utf-8", errors="replace")
     meta.line_count = text.count("\n") + (1 if text and not text.endswith("\n") else 0)
     meta.word_count = len(text.split())
+    meta.token_count = _count_tokens(text)
 
 
 # How many archive levels to unpack before giving up. Guards against a
 # maliciously (or accidentally) deep chain of archives-within-archives eating
 # unbounded memory/CPU -- five is far beyond anything a real submission needs.
-MAX_ARCHIVE_DEPTH = 5
+# for now onlt single depth maybe in future we can increase it
+MAX_ARCHIVE_DEPTH = 1
 
 
 def _open_archive(extension: str, data: bytes):
@@ -312,6 +364,7 @@ def _analyze_archive(
         page_count=sum(f.page_count or 0 for f in files),
         image_count=sum(f.image_count for f in files),
         table_count=sum(f.table_count for f in files),
+        token_count=sum(f.token_count or 0 for f in files),
         files=files,
     )
 
@@ -340,6 +393,7 @@ def analyze(url: str, filename: str, data: bytes, content_type: str | None = Non
         page_count=file_meta.page_count or 0,
         image_count=file_meta.image_count,
         table_count=file_meta.table_count,
+        token_count=file_meta.token_count or 0,
         files=[file_meta],
     )
 
@@ -380,5 +434,5 @@ class DocumentAnalyzerProcessor:
             f"Analyzed {metadata.file_count} file(s) "
             f"({metadata.source_kind}, {metadata.total_size_bytes} bytes) -- "
             f"{metadata.page_count} page(s), {metadata.image_count} image(s), "
-            f"{metadata.table_count} table(s)."
+            f"{metadata.table_count} table(s), {metadata.token_count} token(s)."
         )
