@@ -114,18 +114,28 @@ def testAFailingProcessorMarksTheJobFailed() -> None:
     assert job.detail == "boom"
 
 
-def testShutdownCancelsJobsStillInFlight() -> None:
+def testShutdownWaitsForJobsStillInFlight() -> None:
+    """Shutdown is deliberately not a cancel: a job mid-download or mid-write
+    has no safe halfway point, so it is allowed to finish."""
+
     async def scenario() -> None:
         processor = BlockingProcessor()
         manager = JobManager(processor)
-        manager.create(
+        job = manager.create(
             serverId="svc", documentLink="https://example.com/doc.pdf", ragDbId="job-shutdown"
         )
 
         await processor.started.wait()
-        await manager.shutdown()  # Should not hang waiting for `release`.
 
-    asyncio.run(scenario())  # Timing out here is the failure mode.
+        shutdown = asyncio.create_task(manager.shutdown())
+        await asyncio.sleep(0)  # Let it run far enough to finish early if it would.
+        assert not shutdown.done(), "shutdown returned while a job was still running"
+
+        processor.release.set()
+        await asyncio.wait_for(shutdown, timeout=1.0)
+        assert job.status == JobStatus.DONE
+
+    asyncio.run(scenario())
 
 
 def testShutdownWithNoJobsReturnsImmediately() -> None:

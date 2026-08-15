@@ -86,6 +86,17 @@ def testUnexpectedFieldsAreRejected(client: TestClient) -> None:
     assert response.status_code == 422
 
 
+@pytest.mark.parametrize("field", ["serverId", "question", "ragDbId"])
+def testAValidationErrorNeverEchoesTheSecret(client: TestClient, field: str) -> None:
+    payload = body(serverSecret="SUPER-SECRET-KEY")
+    del payload[field]
+
+    response = client.post("/api/v1/query", json=payload)
+
+    assert response.status_code == 422
+    assert "SUPER-SECRET-KEY" not in response.text
+
+
 def testTheSecretIsNeverEchoedBack(client: TestClient) -> None:
     response = client.post("/api/v1/query", json=body(serverSecret="wrong"))
 
