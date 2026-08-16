@@ -16,6 +16,7 @@ from app.ragIngestionPipeline import (
     ChunkingStrategy,
     IngestionError,
     RagIngestionPipeline,
+    chunkWithoutAi,
     countTokens,
     enforceEmbedLimit,
 )
@@ -135,6 +136,20 @@ def testTheRawStrategyCannotProduceAnUnembeddableChunk(testMode: None, tmp_path)
 
     assert len(result.chunks) > 1
     assert all(c.tokenCount <= MAX_EMBED_TOKENS for c in result.chunks)
+
+
+@pytest.mark.parametrize("overlap", [400, 401, 1000])
+def testChunkingRefusesAnOverlapItCouldNotAdvancePast(overlap: int) -> None:
+    """With an overlap at least as large as the window, each chunk starts
+    where the last one did -- the loop would never end and never raise."""
+    with pytest.raises(IngestionError, match="smaller than the chunk"):
+        chunkWithoutAi(["word " * 100], chunkTokens=400, overlapTokens=overlap)
+
+
+def testChunkingProceedsWhenTheOverlapLeavesRoom() -> None:
+    chunks = chunkWithoutAi(["word " * 100], chunkTokens=400, overlapTokens=399)
+
+    assert chunks
 
 
 def testIdsThatSanitizeAlikeDoNotCollide() -> None:

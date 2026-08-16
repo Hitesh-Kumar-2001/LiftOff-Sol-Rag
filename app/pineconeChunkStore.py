@@ -10,11 +10,12 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import logging
 import os
 from functools import lru_cache, partial
 
 from pinecone import Pinecone
-from pinecone.exceptions import NotFoundException
+from pinecone.exceptions import NotFoundException, PineconeApiException
 
 from app.ragIngestionPipeline import Chunk, IngestionError, SearchResult
 
@@ -30,6 +31,11 @@ PINECONE_EMBED_MODEL = os.environ.get("RAG_PINECONE_EMBED_MODEL", "llama-text-em
 # it as max_batch_size); exceeding it fails the entire request rather than
 # truncating the batch.
 UPSERT_BATCH_SIZE = 96
+
+# Ids per delete call, when clearing records a re-ingest left behind.
+DELETE_BATCH_SIZE = 1000
+
+logger = logging.getLogger(__name__)
 
 
 def namespaceFor(ragDbId: str) -> str:
@@ -61,21 +67,70 @@ class PineconeChunkStore:
         # key to start.
         self.indexName = indexName
         self.index = None
+        self.indexLock = asyncio.Lock()
 
     async def ensureIndex(self) -> None:
+        """Create the index if it is missing, once however many jobs ask.
+
+        Jobs run concurrently, so without the lock two documents submitted
+        together both look for the index, both find it missing, and both try
+        to create it -- and the loser's job fails. The check is repeated
+        inside the lock because the first caller through will have created it
+        by the time the second acquires.
+
+        A conflict is still possible from another *process* racing this one,
+        which no lock here can prevent; that means the index now exists,
+        which is all this method wanted.
+        """
         if self.index is not None:
             return
-        client = pineconeClient()
-        existing = await asyncio.to_thread(client.list_indexes)
-        if self.indexName not in [i["name"] for i in existing]:
-            await asyncio.to_thread(
-                client.create_index_for_model,
-                name=self.indexName,
-                cloud=PINECONE_CLOUD,
-                region=PINECONE_REGION,
-                embed={"model": PINECONE_EMBED_MODEL, "field_map": {"text": "chunkText"}},
-            )
-        self.index = client.Index(self.indexName)
+
+        async with self.indexLock:
+            if self.index is not None:
+                return
+
+            client = pineconeClient()
+            existing = await asyncio.to_thread(client.list_indexes)
+            if self.indexName not in [i["name"] for i in existing]:
+                try:
+                    await asyncio.to_thread(
+                        client.create_index_for_model,
+                        name=self.indexName,
+                        cloud=PINECONE_CLOUD,
+                        region=PINECONE_REGION,
+                        embed={
+                            "model": PINECONE_EMBED_MODEL,
+                            "field_map": {"text": "chunkText"},
+                        },
+                    )
+                except PineconeApiException as exc:
+                    if getattr(exc, "status", None) != 409:
+                        raise
+                    logger.info("Index '%s' was created concurrently.", self.indexName)
+            self.index = client.Index(self.indexName)
+
+    async def listIds(self, ragDbId: str) -> list[str]:
+        """Every record id stored for ``ragDbId``.
+
+        ``index.list`` pages, and each page is a ``ListResponse`` whose
+        ``vectors`` are ``ListItem`` objects -- the ids are on ``.id``, not
+        the items themselves, which the rest of the SDK expects as plain
+        strings.
+        """
+        await self.ensureIndex()
+        namespace = namespaceFor(ragDbId)
+
+        def readPages() -> list[str]:
+            return [
+                item.id
+                for page in self.index.list(namespace=namespace)
+                for item in page.vectors
+            ]
+
+        try:
+            return await asyncio.to_thread(readPages)
+        except NotFoundException:
+            return []
 
     async def save(self, ragDbId: str, chunks: list[Chunk]) -> None:
         await self.ensureIndex()
@@ -91,6 +146,13 @@ class PineconeChunkStore:
         ]
 
         namespace = namespaceFor(ragDbId)
+        # What is already stored, so a re-ingest can clear whatever the new
+        # document does not overwrite. An upsert only replaces ids it names:
+        # re-ingesting a shorter document leaves every record past its last
+        # chunk in place, and search goes on returning that old text as if it
+        # belonged to the new document.
+        stale = set(await self.listIds(ragDbId))
+
         # Pinecone rejects the whole request over its batch limit, and any
         # document worth chunking produces more records than that -- a 10k
         # token article is a few hundred. Sent in order, one batch at a time,
@@ -104,17 +166,34 @@ class PineconeChunkStore:
                 partial(self.index.upsert_records, records=batch, namespace=namespace)
             )
 
+        # After the new records are in, not before: clearing first would
+        # leave the database empty for the length of the upsert, and lose
+        # the old document entirely if the upsert then failed.
+        stale -= {record["_id"] for record in records}
+        if stale:
+            logger.info("Removing %d record(s) left by a previous ingest.", len(stale))
+            await self.deleteIds(sorted(stale), namespace)
+
+    async def deleteIds(self, ids: list[str], namespace: str) -> None:
+        for start in range(0, len(ids), DELETE_BATCH_SIZE):
+            await asyncio.to_thread(
+                partial(
+                    self.index.delete,
+                    ids=ids[start : start + DELETE_BATCH_SIZE],
+                    namespace=namespace,
+                )
+            )
+
     async def get(self, ragDbId: str) -> list[Chunk]:
-        await self.ensureIndex()
         namespace = namespaceFor(ragDbId)
 
-        ids: list[str] = []
-        for batch in await asyncio.to_thread(lambda: list(self.index.list(namespace=namespace))):
-            ids.extend(batch)
+        ids = await self.listIds(ragDbId)
         if not ids:
             return []
 
-        fetched = await asyncio.to_thread(self.index.fetch, ids=ids, namespace=namespace)
+        fetched = await asyncio.to_thread(
+            partial(self.index.fetch, ids=ids, namespace=namespace)
+        )
         chunks = [
             Chunk(
                 text=record.metadata.get("chunkText", ""),

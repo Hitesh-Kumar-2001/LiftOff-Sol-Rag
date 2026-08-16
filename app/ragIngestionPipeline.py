@@ -187,6 +187,18 @@ def chunkWithoutAi(
     overlapTokens: int = DEFAULT_CHUNK_OVERLAP_TOKENS,
 ) -> list[str]:
     """Fixed-size token windows with overlap. No network calls, no cost."""
+    # Each window starts ``chunkTokens - overlapTokens`` further on, so an
+    # overlap at least as large as the window never advances: the loop below
+    # would append the same tokens until memory ran out. A hung job is a
+    # worse way to learn that than a failed one, and both numbers come from
+    # configuration (RAG_MAX_EMBED_TOKENS among them), so this is reachable
+    # without touching the code.
+    if overlapTokens >= chunkTokens:
+        raise IngestionError(
+            f"Chunk overlap ({overlapTokens}) must be smaller than the chunk "
+            f"size ({chunkTokens}); otherwise chunking cannot make progress."
+        )
+
     encoding = tokenEncoding()
     chunks: list[str] = []
     for section in sections:
