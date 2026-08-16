@@ -46,7 +46,10 @@ class RagIngestionProcessor:
 
         # The strategy is chosen from the metadata we just extracted, so a
         # 500-token note and a 500k-token manual are not chunked the same way.
+        # Recorded on the job because a RAW document has no vector database to
+        # query, and /document/status answers with the link instead.
         strategy = self.selector.suggest(metadata)
+        job.strategy = strategy
 
         # The document's bytes are already in hand, so the text comes from
         # them rather than from a second download inside the pipeline.

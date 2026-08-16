@@ -18,6 +18,7 @@ from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
     from app.documents import DocumentMetadata, DocumentProcessor
+    from app.ragIngestionPipeline import ChunkingStrategy
 
 logger = logging.getLogger(__name__)
 
@@ -46,6 +47,11 @@ class Job:
     # Set by DocumentAnalyzerProcessor once the download is analyzed. None
     # until then, and for processors (like the stub) that don't produce it.
     metadata: "DocumentMetadata | None" = None
+    # How the document was chunked, once a processor has chosen. None until
+    # then. RAW means the document was small enough to keep whole, so there
+    # is no vector database to query and callers are pointed back at
+    # documentLink instead -- see the /document/status route.
+    strategy: "ChunkingStrategy | None" = None
     createdAt: datetime = field(default_factory=_now)
     updatedAt: datetime = field(default_factory=_now)
 

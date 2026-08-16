@@ -1,5 +1,6 @@
 import asyncio
-from collections.abc import Iterator
+from collections.abc import Generator, Iterator
+from contextlib import contextmanager
 
 import pytest
 from fastapi.testclient import TestClient
@@ -7,15 +8,35 @@ from fastapi.testclient import TestClient
 from app.credentials import InMemoryCredentialSource, ServerCredential, hashSecret
 from app.documents import StubDocumentProcessor
 from app.jobManager import JobManager, getJobManager
-from app.jobs import JobStatus
+from app.jobs import Job, JobStatus
 from app.main import app
+from app.ragIngestionPipeline import ChunkingStrategy
 from app.security import ServerRegistry, getServerRegistry
 
 SECRET = "s3cr3t-api-key"
 
 
-@pytest.fixture
-def client() -> Iterator[TestClient]:
+class SelectingProcessor:
+    """Records a chunking strategy the way RagIngestionProcessor does, without
+    downloading or analyzing anything."""
+
+    def __init__(self, strategy: ChunkingStrategy) -> None:
+        self.strategy = strategy
+
+    async def process(self, job: Job) -> None:
+        job.strategy = self.strategy
+
+
+class BlockingProcessor:
+    """Never finishes, so a job stays before the point where a strategy is
+    chosen."""
+
+    async def process(self, job: Job) -> None:
+        await asyncio.Event().wait()
+
+
+@contextmanager
+def clientUsing(processor) -> Generator[TestClient]:
     registry = ServerRegistry(
         InMemoryCredentialSource(
             [ServerCredential(serverId="billing-service", secretHash=hashSecret(SECRET))]
@@ -23,13 +44,29 @@ def client() -> Iterator[TestClient]:
     )
     asyncio.run(registry.loadAll())
 
-    jobManager = JobManager(StubDocumentProcessor())
+    # One manager for the whole test, not one per request -- a fresh instance
+    # per call would make jobs vanish between the create and the lookup.
+    jobManager = JobManager(processor)
 
     app.dependency_overrides[getServerRegistry] = lambda: registry
     app.dependency_overrides[getJobManager] = lambda: jobManager
-    with TestClient(app) as testClient:
+    try:
+        with TestClient(app) as testClient:
+            yield testClient
+    finally:
+        app.dependency_overrides.clear()
+
+
+@pytest.fixture
+def client() -> Iterator[TestClient]:
+    with clientUsing(StubDocumentProcessor()) as testClient:
         yield testClient
-    app.dependency_overrides.clear()
+
+
+@pytest.fixture
+def rawClient() -> Iterator[TestClient]:
+    with clientUsing(SelectingProcessor(ChunkingStrategy.RAW)) as testClient:
+        yield testClient
 
 
 def body(**overrides: str) -> dict[str, str]:
@@ -83,6 +120,50 @@ def testAFinishedJobReportsStatusAndRagDbIdOnly(client: TestClient) -> None:
     payload = waitForDone(client)
 
     assert payload == {"status": "done", "ragDbId": "handbook"}
+
+
+def testARawDocumentAnswersWithItsLinkInsteadOfARagDbId(rawClient: TestClient) -> None:
+    """A document kept whole was never written to a vector database, so there
+    is nothing to query by ragDbId."""
+    submit(rawClient)
+
+    payload = waitForDone(rawClient)
+
+    assert payload == {"status": "done", "documentLink": "https://example.com/handbook.pdf"}
+
+
+@pytest.mark.parametrize(
+    "strategy", [ChunkingStrategy.NON_AI, ChunkingStrategy.AI], ids=["nonAi", "ai"]
+)
+def testAChunkedDocumentAnswersWithItsRagDbId(strategy: ChunkingStrategy) -> None:
+    with clientUsing(SelectingProcessor(strategy)) as client:
+        submit(client)
+
+        payload = waitForDone(client)
+
+        assert payload == {"status": "done", "ragDbId": "handbook"}
+
+
+def testTheTwoAnswersAreNeverSentTogether(rawClient: TestClient) -> None:
+    """The absent field is omitted rather than sent as null, so a caller can
+    tell which arrived by presence alone."""
+    submit(rawClient)
+
+    payload = waitForDone(rawClient)
+
+    assert ("ragDbId" in payload) != ("documentLink" in payload)
+
+
+def testAJobStillQueuedAnswersWithItsRagDbId() -> None:
+    """The strategy is not known until the document has been analyzed, so a
+    job that has not got there yet is answered the ordinary way."""
+    with clientUsing(BlockingProcessor()) as client:
+        submit(client)
+
+        payload = client.post("/api/v1/document/status", json=body()).json()
+
+        assert payload["ragDbId"] == "handbook"
+        assert "documentLink" not in payload
 
 
 def testTheStatusIsReportedForTheRagDbIdAsked(client: TestClient) -> None:

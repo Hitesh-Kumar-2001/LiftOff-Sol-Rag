@@ -65,15 +65,23 @@ class JobResponse(CamelModel):
 
 
 class JobStatusResponse(CamelModel):
-    """Deliberately just the two fields.
+    """Deliberately just two fields: the status, and where to go next.
 
-    No detail, no metadata, no chunk counts: a caller polling this wants to
+    No detail, no metadata, no chunk counts -- a caller polling this wants to
     know whether it can query yet, and everything else is either noise or a
     description of another server's document.
+
+    "Where to go next" is one of the two below, never both. A document kept
+    whole (ChunkingStrategy.RAW) was never written to a vector database, so
+    there is nothing to query by ragDbId; that caller gets ``documentLink``
+    back and should read the source directly. Everything else gets
+    ``ragDbId``. The absent field is omitted from the response rather than
+    sent as null, so which one arrived is unambiguous.
     """
 
     status: str
-    rag_db_id: str
+    rag_db_id: str | None = None
+    document_link: str | None = None
 
 
 class ErrorResponse(CamelModel):

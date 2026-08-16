@@ -5,6 +5,7 @@ from typing import Annotated
 from fastapi import APIRouter, Depends, HTTPException, status
 
 from app.jobManager import JobManager, getJobManager
+from app.ragIngestionPipeline import ChunkingStrategy
 from app.schemas import (
     DocumentIngestRequest,
     ErrorResponse,
@@ -91,6 +92,7 @@ async def submitDocument(
 @router.post(
     "/document/status",
     response_model=JobStatusResponse,
+    response_model_exclude_none=True,
     summary="Check how a document's ingestion is going",
     tags=["documents"],
     responses={
@@ -103,7 +105,8 @@ async def documentStatus(
     registry: Annotated[ServerRegistry, Depends(getServerRegistry)],
     jobs: Annotated[JobManager, Depends(getJobManager)],
 ) -> JobStatusResponse:
-    """Verify the calling server, then report the job's status and nothing else.
+    """Verify the calling server, then report the job's status and where to
+    go next -- nothing else.
 
     A POST rather than a GET so the credentials stay in the body: this API
     carries them there, and a GET would put a secret in a query string, where
@@ -122,5 +125,11 @@ async def documentStatus(
             status_code=status.HTTP_404_NOT_FOUND,
             detail=f"No ingestion job for ragDbId '{payload.rag_db_id}'.",
         )
+
+    # A document small enough to keep whole was never written to a vector
+    # database, so answering with its ragDbId would name something there is
+    # nothing behind. That caller is sent back to the source instead.
+    if job.strategy is ChunkingStrategy.RAW:
+        return JobStatusResponse(status=job.status.value, document_link=job.documentLink)
 
     return JobStatusResponse(status=job.status.value, rag_db_id=job.jobId)
