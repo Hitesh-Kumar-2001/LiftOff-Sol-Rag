@@ -1,5 +1,6 @@
 import asyncio
-from collections.abc import Iterator
+from collections.abc import Generator, Iterator
+from contextlib import contextmanager
 
 import pytest
 from fastapi.testclient import TestClient
@@ -7,14 +8,22 @@ from fastapi.testclient import TestClient
 from app.credentials import InMemoryCredentialSource, ServerCredential, hashSecret
 from app.documents import StubDocumentProcessor
 from app.jobManager import JobManager, getJobManager
+from app.jobs import Job
 from app.main import app
 from app.security import ServerRegistry, getServerRegistry
 
 SECRET = "s3cr3t-api-key"
 
 
-@pytest.fixture
-def client() -> Iterator[TestClient]:
+class BlockingProcessor:
+    """Never finishes, so a job stays mid-ingest for as long as a test needs."""
+
+    async def process(self, job: Job) -> None:
+        await asyncio.Event().wait()
+
+
+@contextmanager
+def clientUsing(processor) -> Generator[TestClient]:
     registry = ServerRegistry(
         InMemoryCredentialSource(
             [ServerCredential(serverId="billing-service", secretHash=hashSecret(SECRET))]
@@ -24,13 +33,21 @@ def client() -> Iterator[TestClient]:
 
     # One manager per test, not one per request -- a fresh instance per call
     # would make jobs vanish between the create and any later lookup.
-    jobManager = JobManager(StubDocumentProcessor())
+    jobManager = JobManager(processor)
 
     app.dependency_overrides[getServerRegistry] = lambda: registry
     app.dependency_overrides[getJobManager] = lambda: jobManager
-    with TestClient(app) as testClient:
+    try:
+        with TestClient(app) as testClient:
+            yield testClient
+    finally:
+        app.dependency_overrides.clear()
+
+
+@pytest.fixture
+def client() -> Iterator[TestClient]:
+    with clientUsing(StubDocumentProcessor()) as testClient:
         yield testClient
-    app.dependency_overrides.clear()
 
 
 def body(**overrides: str) -> dict[str, str]:
@@ -66,6 +83,44 @@ def testResubmittingARagDbIdReusesItsJobId(client: TestClient) -> None:
     second = client.post("/api/v1/document", json=body(ragDbId="handbook")).json()
 
     assert first["jobId"] == second["jobId"] == "handbook"
+
+
+def testResubmittingTheSameDocumentIsAccepted(client: TestClient) -> None:
+    """The stub finishes immediately, so this is the settled case: the same
+    document again is a duplicate, not a conflict."""
+    first = client.post("/api/v1/document", json=body(ragDbId="handbook"))
+    second = client.post("/api/v1/document", json=body(ragDbId="handbook"))
+
+    assert first.status_code == second.status_code == 202
+
+
+def testADifferentDocumentMidIngestIsAConflict() -> None:
+    """409 rather than 202: nothing was queued, because running it would
+    leave the database holding part of each document."""
+    with clientUsing(BlockingProcessor()) as client:
+        client.post("/api/v1/document", json=body(ragDbId="handbook"))
+
+        response = client.post(
+            "/api/v1/document",
+            json=body(ragDbId="handbook", documentLink="https://example.com/other.pdf"),
+        )
+
+        assert response.status_code == 409
+        assert "already being ingested" in response.json()["detail"]
+
+
+def testAConflictQueuesNothing() -> None:
+    with clientUsing(BlockingProcessor()) as client:
+        client.post("/api/v1/document", json=body(ragDbId="handbook"))
+        manager = app.dependency_overrides[getJobManager]()
+        before = len(manager)
+
+        client.post(
+            "/api/v1/document",
+            json=body(ragDbId="handbook", documentLink="https://example.com/other.pdf"),
+        )
+
+        assert len(manager) == before
 
 
 def testWrongSecretIsRejected(client: TestClient) -> None:

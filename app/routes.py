@@ -4,7 +4,7 @@ from typing import Annotated
 
 from fastapi import APIRouter, Depends, HTTPException, status
 
-from app.jobManager import JobManager, getJobManager
+from app.jobManager import JobConflictError, JobManager, getJobManager
 from app.ragIngestionPipeline import ChunkingStrategy
 from app.chunkStoreFactory import getChunkStore
 from app.ragIngestionPipeline import ChunkStore
@@ -68,6 +68,10 @@ async def query(
     tags=["documents"],
     responses={
         401: {"model": ErrorResponse, "description": "Unknown serverId or serverSecret"},
+        409: {
+            "model": ErrorResponse,
+            "description": "A different document is already being ingested into this ragDbId",
+        },
     },
 )
 async def submitDocument(
@@ -86,11 +90,17 @@ async def submitDocument(
     """
     _requireServer(registry, payload.server_id, payload.server_secret.get_secret_value())
 
-    job = jobs.create(
-        serverId=payload.server_id,
-        documentLink=payload.document_link,
-        ragDbId=payload.rag_db_id,
-    )
+    try:
+        job = jobs.create(
+            serverId=payload.server_id,
+            documentLink=payload.document_link,
+            ragDbId=payload.rag_db_id,
+        )
+    except JobConflictError as exc:
+        # Not a 202: nothing was queued, and running it anyway would leave the
+        # database holding half of each document.
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(exc)) from None
+
     return JobResponse(job_id=job.jobId, status=job.status.value)
 
 

@@ -10,10 +10,14 @@ import asyncio
 import logging
 
 from app.documents import DocumentProcessor
-from app.jobs import Job, runJob
+from app.jobs import Job, JobStatus, runJob
 from app.ragProcessor import RagIngestionProcessor
 
 logger = logging.getLogger(__name__)
+
+
+class JobConflictError(Exception):
+    """A different document is already being ingested into this ragDbId."""
 
 
 class JobManager:
@@ -22,13 +26,24 @@ class JobManager:
     Jobs do not survive a restart -- there is no persistence layer. Fine for a
     single node; revisit if a queued job needs to survive a deploy.
 
-    A job's id is its ``ragDbId`` (see ``Job.jobId``), so submitting a second
-    document for a ragDbId that already has a job reuses that id and replaces
-    the previous record here. The task behind the replaced job is *not*
-    cancelled -- it keeps running to completion (or failure), updating a Job
-    instance nothing can look up anymore once its slot is overwritten.
-    Deduplicating, queueing, or cancelling on resubmission is a policy
-    decision for later; nothing here assumes one yet.
+    A job's id is its ``ragDbId`` (see ``Job.jobId``), so every submission for
+    one database lands on one job. What a second submission means depends on
+    whether it is the same work:
+
+    * the same document again -- a retry, a duplicate delivery, an impatient
+      caller -- returns the existing job untouched. Ingesting it twice would
+      cost the same money to produce the same records.
+    * a *different* document, while the first is still running, is refused.
+      Both jobs write to one database under ids derived from chunk position,
+      so whichever finishes last silently overwrites part of the other and
+      leaves the database holding half of each. There is no safe way to run
+      them at once, and cancelling the first has no safe halfway point to
+      stop at either.
+    * a different document once nothing is running replaces what is there,
+      which is the ordinary way to re-ingest a database.
+
+    A failed job is never reused -- resubmitting the same document after a
+    failure retries it.
     """
 
     def __init__(self, processor: DocumentProcessor) -> None:
@@ -40,7 +55,22 @@ class JobManager:
         return len(self._jobs)
 
     def create(self, *, serverId: str, documentLink: str, ragDbId: str) -> Job:
-        """Record a queued job under ``ragDbId`` and run it in the background."""
+        """Record a queued job under ``ragDbId`` and run it in the background.
+
+        Raises ``JobConflictError`` if a different document is mid-ingest into
+        the same database.
+        """
+        existing = self._jobs.get(ragDbId)
+        if existing is not None and existing.status is not JobStatus.FAILED:
+            if (existing.documentLink, existing.serverId) == (documentLink, serverId):
+                logger.info("Reusing job '%s'; same document already submitted.", ragDbId)
+                return existing
+            if existing.status in (JobStatus.QUEUED, JobStatus.PROCESSING):
+                raise JobConflictError(
+                    f"'{existing.documentLink}' is already being ingested into "
+                    f"'{ragDbId}'. Wait for it to finish before submitting another."
+                )
+
         job = Job(jobId=ragDbId, serverId=serverId, documentLink=documentLink)
         self._jobs[job.jobId] = job
 

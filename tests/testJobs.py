@@ -3,7 +3,7 @@ import asyncio
 import pytest
 
 from app.documents import StubDocumentProcessor
-from app.jobManager import JobManager
+from app.jobManager import JobConflictError, JobManager
 from app.jobs import Job, JobStatus
 
 
@@ -134,6 +134,110 @@ def testShutdownWaitsForJobsStillInFlight() -> None:
         processor.release.set()
         await asyncio.wait_for(shutdown, timeout=1.0)
         assert job.status == JobStatus.DONE
+
+    asyncio.run(scenario())
+
+
+LINK = "https://example.com/doc.pdf"
+OTHER_LINK = "https://example.com/other.pdf"
+
+
+def testResubmittingTheSameDocumentReusesItsJob() -> None:
+    """A retry or a duplicate delivery should not pay to ingest the same
+    document twice into the same database."""
+
+    async def scenario() -> None:
+        processor = BlockingProcessor()
+        manager = JobManager(processor)
+
+        first = manager.create(serverId="svc", documentLink=LINK, ragDbId="handbook")
+        await processor.started.wait()
+        second = manager.create(serverId="svc", documentLink=LINK, ragDbId="handbook")
+
+        assert second is first
+        assert len(manager._tasks) == 1, "a second ingestion was started"
+
+        processor.release.set()
+        await _waitUntil(lambda: first.status == JobStatus.DONE)
+
+    asyncio.run(scenario())
+
+
+def testADifferentDocumentIsRefusedWhileOneIsStillIngesting() -> None:
+    """Both would write to one database under ids derived from chunk
+    position, leaving it holding part of each document."""
+
+    async def scenario() -> None:
+        processor = BlockingProcessor()
+        manager = JobManager(processor)
+        manager.create(serverId="svc", documentLink=LINK, ragDbId="handbook")
+        await processor.started.wait()
+
+        with pytest.raises(JobConflictError):
+            manager.create(serverId="svc", documentLink=OTHER_LINK, ragDbId="handbook")
+
+        processor.release.set()
+
+    asyncio.run(scenario())
+
+
+def testADifferentDocumentReplacesAFinishedOne() -> None:
+    """Re-ingesting a database once nothing is running is ordinary."""
+
+    async def scenario() -> None:
+        manager = JobManager(StubDocumentProcessor())
+        first = manager.create(serverId="svc", documentLink=LINK, ragDbId="handbook")
+        await _waitUntil(lambda: first.status == JobStatus.DONE)
+
+        second = manager.create(serverId="svc", documentLink=OTHER_LINK, ragDbId="handbook")
+
+        assert second is not first
+        assert manager.get("handbook") is second
+
+    asyncio.run(scenario())
+
+
+def testAFailedJobIsRetriedRatherThanReused() -> None:
+    async def scenario() -> None:
+        manager = JobManager(FailingProcessor())
+        first = manager.create(serverId="svc", documentLink=LINK, ragDbId="handbook")
+        await _waitUntil(lambda: first.status == JobStatus.FAILED)
+
+        second = manager.create(serverId="svc", documentLink=LINK, ragDbId="handbook")
+
+        assert second is not first
+
+    asyncio.run(scenario())
+
+
+def testAnotherServerSubmittingTheSameLinkIsNotTreatedAsADuplicate() -> None:
+    """Same link, different caller -- the match has to be on both."""
+
+    async def scenario() -> None:
+        processor = BlockingProcessor()
+        manager = JobManager(processor)
+        manager.create(serverId="svc", documentLink=LINK, ragDbId="handbook")
+        await processor.started.wait()
+
+        with pytest.raises(JobConflictError):
+            manager.create(serverId="other", documentLink=LINK, ragDbId="handbook")
+
+        processor.release.set()
+
+    asyncio.run(scenario())
+
+
+def testDifferentDatabasesNeverConflict() -> None:
+    async def scenario() -> None:
+        processor = BlockingProcessor()
+        manager = JobManager(processor)
+        manager.create(serverId="svc", documentLink=LINK, ragDbId="handbook")
+        await processor.started.wait()
+
+        manager.create(serverId="svc", documentLink=OTHER_LINK, ragDbId="policies")
+
+        assert len(manager) == 2
+        processor.release.set()
 
     asyncio.run(scenario())
 
