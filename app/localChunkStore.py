@@ -17,7 +17,7 @@ import os
 import re
 from pathlib import Path
 
-from app.ragIngestionPipeline import Chunk, IngestionError
+from app.ragIngestionPipeline import Chunk, IngestionError, SearchResult, lexicalSearch
 
 ENV_TEST_MODE = "RAG_TEST_MODE"
 ENV_LOCAL_STORE_DIR = "RAG_LOCAL_STORE_DIR"
@@ -91,3 +91,13 @@ class LocalChunkStore:
 
     async def delete(self, ragDbId: str) -> None:
         self.pathFor(ragDbId).unlink(missing_ok=True)
+
+    async def search(self, ragDbId: str, query: str, topK: int = 5) -> list[SearchResult]:
+        """Keyword search over the stored chunks.
+
+        There are no embeddings here -- computing them is what the vector
+        database is for -- so this ranks by shared terms instead. It proves
+        the ingestion/retrieval path end to end without a network call; it is
+        not a stand-in for what Pinecone returns.
+        """
+        return lexicalSearch(await self.get(ragDbId), query, topK)

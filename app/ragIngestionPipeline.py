@@ -13,8 +13,10 @@ resubmission under an existing ``ragDbId`` (see ``app.jobManager``).
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
+import math
 import os
 import re
 from collections.abc import Awaitable, Callable
@@ -28,6 +30,7 @@ from urllib.parse import urlparse
 import httpx
 import tiktoken
 from google import genai
+from google.genai import types
 
 logger = logging.getLogger(__name__)
 
@@ -51,6 +54,11 @@ DEFAULT_CHUNK_OVERLAP_TOKENS = 40
 # whole, and the AI chunker is *asked* for a size but can return anything.
 # enforceEmbedLimit below is what actually makes it true.
 MAX_EMBED_TOKENS = int(os.environ.get("RAG_MAX_EMBED_TOKENS", "2048"))
+
+# How many sections may be in flight at the API at once. Enough to keep a
+# large document from taking minutes of serial round trips, low enough not to
+# look like a burst worth rate-limiting.
+AI_CHUNK_CONCURRENCY = int(os.environ.get("RAG_AI_CHUNK_CONCURRENCY", "8"))
 
 AI_CHUNK_PROMPT = (
     "Split the TEXT below into self-contained semantic chunks. Each chunk "
@@ -82,6 +90,53 @@ class IngestedDocument:
     ragDbId: str
     sourceUrl: str
     chunks: list[Chunk] = field(default_factory=list)
+
+
+@dataclass
+class SearchResult:
+    """One chunk a search matched.
+
+    ``score`` is comparable only within a single store: Pinecone returns a
+    cosine similarity over embeddings, the offline stores return a lexical
+    overlap. Ordering is meaningful either way; the absolute number is not.
+    """
+
+    text: str
+    index: int
+    score: float
+
+
+# A query term worth matching on. Splitting on non-word characters rather
+# than whitespace so "vector-database." and "vector database" agree.
+_TERM_PATTERN = re.compile(r"\w+")
+
+
+def lexicalSearch(chunks: list[Chunk], query: str, topK: int) -> list[SearchResult]:
+    """Rank ``chunks`` against ``query`` by shared terms.
+
+    What the offline stores use in place of embeddings. It is a keyword
+    overlap and nothing more -- no synonyms, no semantics -- so it is good
+    enough to prove a chunk was stored and is reachable, and not good enough
+    to judge retrieval quality by. Longer chunks are divided down so a large
+    chunk cannot outrank a focused one just by containing more words.
+    """
+    queryTerms = set(_TERM_PATTERN.findall(query.lower()))
+    if not queryTerms:
+        return []
+
+    scored: list[SearchResult] = []
+    for chunk in chunks:
+        chunkTerms = _TERM_PATTERN.findall(chunk.text.lower())
+        if not chunkTerms:
+            continue
+        overlap = queryTerms.intersection(chunkTerms)
+        if not overlap:
+            continue
+        score = len(overlap) / math.sqrt(len(set(chunkTerms)))
+        scored.append(SearchResult(text=chunk.text, index=chunk.index, score=score))
+
+    scored.sort(key=lambda r: (-r.score, r.index))
+    return scored[:topK]
 
 
 @lru_cache(maxsize=1)
@@ -188,17 +243,50 @@ async def chunkWithAi(
     model: str = GEMINI_MODEL,
     maxTokens: int = DEFAULT_CHUNK_TOKENS,
 ) -> list[str]:
-    """Ask Gemini Flash to pick semantic chunk boundaries within each section."""
+    """Ask Gemini Flash to pick semantic chunk boundaries within each section.
+
+    One call per section, run several at a time. Sections are independent --
+    each is chunked on its own -- so waiting for one before starting the next
+    only adds latency: a 10k-token document is ~60 sections, which is a
+    minute of round trips serially and a few seconds in parallel. The
+    semaphore keeps that from becoming an unbounded burst of requests at the
+    API on a large document.
+
+    ``gather`` preserves order, so chunks come back in document order rather
+    than completion order.
+    """
     client = geminiClient()
-    chunks: list[str] = []
-    for section in sections:
+    semaphore = asyncio.Semaphore(AI_CHUNK_CONCURRENCY)
+
+    async def chunkSection(section: str) -> list[str]:
         prompt = AI_CHUNK_PROMPT.format(maxTokens=maxTokens, text=section)
+        async with semaphore:
+            try:
+                response = await client.aio.models.generate_content(
+                    model=model,
+                    contents=prompt,
+                    # Ask the API to constrain the output rather than trusting
+                    # the prompt to. Told only in words, the model answers
+                    # real prose with JSON containing invalid escapes -- a
+                    # backslash from the source text passed through verbatim.
+                    config=types.GenerateContentConfig(
+                        response_mime_type="application/json",
+                        response_schema=list[str],
+                    ),
+                )
+            except Exception as exc:
+                raise IngestionError(f"Gemini chunking failed: {exc}") from exc
+
         try:
-            response = await client.aio.models.generate_content(model=model, contents=prompt)
-        except Exception as exc:
-            raise IngestionError(f"Gemini chunking failed: {exc}") from exc
-        chunks.extend(parseAiChunks(response.text))
-    return chunks
+            return parseAiChunks(response.text)
+        except IngestionError as exc:
+            # One unusable answer should not lose a whole document. The
+            # non-AI split is a worse chunk boundary, not a wrong one.
+            logger.warning("Falling back to non-AI chunking for one section: %s", exc)
+            return chunkWithoutAi([section], chunkTokens=maxTokens)
+
+    perSection = await asyncio.gather(*(chunkSection(s) for s in sections))
+    return [chunk for section in perSection for chunk in section]
 
 
 def parseAiChunks(raw: str | None) -> list[str]:
@@ -236,6 +324,8 @@ class ChunkStore(Protocol):
 
     async def delete(self, ragDbId: str) -> None: ...
 
+    async def search(self, ragDbId: str, query: str, topK: int) -> list[SearchResult]: ...
+
 
 class InMemoryChunkStore:
     def __init__(self) -> None:
@@ -249,6 +339,9 @@ class InMemoryChunkStore:
 
     async def delete(self, ragDbId: str) -> None:
         self.byRagDbId.pop(ragDbId, None)
+
+    async def search(self, ragDbId: str, query: str, topK: int = 5) -> list[SearchResult]:
+        return lexicalSearch(await self.get(ragDbId), query, topK)
 
 
 class RagIngestionPipeline:

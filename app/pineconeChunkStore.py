@@ -11,12 +11,12 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import os
-from functools import lru_cache
+from functools import lru_cache, partial
 
 from pinecone import Pinecone
 from pinecone.exceptions import NotFoundException
 
-from app.ragIngestionPipeline import Chunk, IngestionError
+from app.ragIngestionPipeline import Chunk, IngestionError, SearchResult
 
 ENV_PINECONE_API_KEY = "PINECONE_API_KEY"
 PINECONE_INDEX_NAME = os.environ.get("RAG_PINECONE_INDEX", "rag-chunks")
@@ -25,6 +25,11 @@ PINECONE_REGION = os.environ.get("RAG_PINECONE_REGION", "us-east-1")
 # Pinecone-hosted embedding model -- the index embeds chunk text itself, so
 # this pipeline never has to run its own embedding step.
 PINECONE_EMBED_MODEL = os.environ.get("RAG_PINECONE_EMBED_MODEL", "llama-text-embed-v2")
+
+# Records per upsert call. Pinecone's own ceiling (the embedding model reports
+# it as max_batch_size); exceeding it fails the entire request rather than
+# truncating the batch.
+UPSERT_BATCH_SIZE = 96
 
 
 def namespaceFor(ragDbId: str) -> str:
@@ -84,7 +89,20 @@ class PineconeChunkStore:
             }
             for chunk in chunks
         ]
-        await asyncio.to_thread(self.index.upsert_records, namespaceFor(ragDbId), records)
+
+        namespace = namespaceFor(ragDbId)
+        # Pinecone rejects the whole request over its batch limit, and any
+        # document worth chunking produces more records than that -- a 10k
+        # token article is a few hundred. Sent in order, one batch at a time,
+        # so a rate limit is not provoked by fanning them out.
+        for start in range(0, len(records), UPSERT_BATCH_SIZE):
+            batch = records[start : start + UPSERT_BATCH_SIZE]
+            # Keyword arguments: upsert_records takes them keyword-only, and
+            # passing them positionally raises rather than being silently
+            # misordered.
+            await asyncio.to_thread(
+                partial(self.index.upsert_records, records=batch, namespace=namespace)
+            )
 
     async def get(self, ragDbId: str) -> list[Chunk]:
         await self.ensureIndex()
@@ -107,6 +125,38 @@ class PineconeChunkStore:
         ]
         chunks.sort(key=lambda c: c.index)
         return chunks
+
+    async def search(self, ragDbId: str, query: str, topK: int = 5) -> list[SearchResult]:
+        """Nearest chunks to ``query`` within this database's namespace.
+
+        The query text is embedded by Pinecone with the same model the
+        records were, which is the point of an integrated-embedding index:
+        nothing here has to know the model, or keep in step with it.
+
+        A namespace that was never written to is not an error -- it means
+        nothing has been ingested under this ragDbId yet, so there is nothing
+        to match.
+        """
+        await self.ensureIndex()
+        try:
+            response = await asyncio.to_thread(
+                self.index.search,
+                namespace=namespaceFor(ragDbId),
+                top_k=topK,
+                inputs={"text": query},
+                fields=["chunkText", "chunkIndex"],
+            )
+        except NotFoundException:
+            return []
+
+        return [
+            SearchResult(
+                text=hit.fields.get("chunkText", ""),
+                index=int(hit.fields.get("chunkIndex", 0)),
+                score=float(hit.score),
+            )
+            for hit in response.result.hits
+        ]
 
     async def delete(self, ragDbId: str) -> None:
         """Drop every chunk stored for ``ragDbId``.
