@@ -9,6 +9,8 @@ from app.schemas import (
     DocumentIngestRequest,
     ErrorResponse,
     JobResponse,
+    JobStatusRequest,
+    JobStatusResponse,
     QueryRequest,
     QueryResponse,
 )
@@ -84,3 +86,41 @@ async def submitDocument(
         ragDbId=payload.rag_db_id,
     )
     return JobResponse(job_id=job.jobId, status=job.status.value)
+
+
+@router.post(
+    "/document/status",
+    response_model=JobStatusResponse,
+    summary="Check how a document's ingestion is going",
+    tags=["documents"],
+    responses={
+        401: {"model": ErrorResponse, "description": "Unknown serverId or serverSecret"},
+        404: {"model": ErrorResponse, "description": "No job for that ragDbId"},
+    },
+)
+async def documentStatus(
+    payload: JobStatusRequest,
+    registry: Annotated[ServerRegistry, Depends(getServerRegistry)],
+    jobs: Annotated[JobManager, Depends(getJobManager)],
+) -> JobStatusResponse:
+    """Verify the calling server, then report the job's status and nothing else.
+
+    A POST rather than a GET so the credentials stay in the body: this API
+    carries them there, and a GET would put a secret in a query string, where
+    it lands in access logs and browser history.
+
+    Jobs live in memory, so a ragDbId ingested before the last restart reads
+    as 404 rather than as done. That distinction matters to a caller deciding
+    whether to resubmit, which is why an unknown id is not reported as some
+    'unknown' status.
+    """
+    _requireServer(registry, payload.server_id, payload.server_secret.get_secret_value())
+
+    job = jobs.get(payload.rag_db_id)
+    if job is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"No ingestion job for ragDbId '{payload.rag_db_id}'.",
+        )
+
+    return JobStatusResponse(status=job.status.value, rag_db_id=job.jobId)

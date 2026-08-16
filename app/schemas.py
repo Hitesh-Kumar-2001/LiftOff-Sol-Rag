@@ -45,9 +45,35 @@ class DocumentIngestRequest(CamelModel):
     rag_db_id: str = Field(min_length=1, max_length=128)
 
 
+class JobStatusRequest(CamelModel):
+    model_config = ConfigDict(
+        alias_generator=to_camel,
+        populate_by_name=True,
+        extra="forbid",
+    )
+
+    server_id: str = Field(min_length=1, max_length=128)
+    server_secret: SecretStr = Field(min_length=1, max_length=512)
+    # The database whose ingestion is being asked about. Also the job's id --
+    # see app.jobs.Job.job_id.
+    rag_db_id: str = Field(min_length=1, max_length=128)
+
+
 class JobResponse(CamelModel):
     job_id: str
     status: str
+
+
+class JobStatusResponse(CamelModel):
+    """Deliberately just the two fields.
+
+    No detail, no metadata, no chunk counts: a caller polling this wants to
+    know whether it can query yet, and everything else is either noise or a
+    description of another server's document.
+    """
+
+    status: str
+    rag_db_id: str
 
 
 class ErrorResponse(CamelModel):
