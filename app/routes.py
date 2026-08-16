@@ -6,6 +6,8 @@ from fastapi import APIRouter, Depends, HTTPException, status
 
 from app.jobManager import JobManager, getJobManager
 from app.ragIngestionPipeline import ChunkingStrategy
+from app.chunkStoreFactory import getChunkStore
+from app.ragIngestionPipeline import ChunkStore
 from app.schemas import (
     DocumentIngestRequest,
     ErrorResponse,
@@ -14,6 +16,9 @@ from app.schemas import (
     JobStatusResponse,
     QueryRequest,
     QueryResponse,
+    SearchHit,
+    SearchRequest,
+    SearchResponse,
 )
 from app.security import AuthenticationError, ServerRegistry, getServerRegistry
 
@@ -133,3 +138,44 @@ async def documentStatus(
         return JobStatusResponse(status=job.status.value, document_link=job.documentLink)
 
     return JobStatusResponse(status=job.status.value, rag_db_id=job.jobId)
+
+
+@router.post(
+    "/search",
+    response_model=SearchResponse,
+    summary="Search a RAG database for the chunks nearest a query",
+    tags=["query"],
+    responses={
+        401: {"model": ErrorResponse, "description": "Unknown serverId or serverSecret"},
+    },
+)
+async def search(
+    payload: SearchRequest,
+    registry: Annotated[ServerRegistry, Depends(getServerRegistry)],
+    store: Annotated[ChunkStore, Depends(getChunkStore)],
+) -> SearchResponse:
+    """Verify the calling server, then return the chunks matching its query.
+
+    Retrieval only -- the matching passages, not an answer written from them.
+    Generating an answer is ``/query``'s job, and keeping the two apart means
+    a caller can see what was actually retrieved rather than inferring it
+    from a summary.
+
+    Which store answers is not decided here: under test mode it is the local
+    one and the ranking is keyword overlap, otherwise it is Pinecone and the
+    ranking is embedding similarity. Both satisfy the same protocol.
+
+    A ragDbId that was never ingested has nothing to match, so it comes back
+    with no hits rather than a 404 -- an empty database and an empty result
+    set are the same answer to "what matches this query".
+    """
+    _requireServer(registry, payload.server_id, payload.server_secret.get_secret_value())
+
+    results = await store.search(payload.rag_db_id, payload.query, payload.top_k)
+
+    return SearchResponse(
+        rag_db_id=payload.rag_db_id,
+        hits=[
+            SearchHit(text=r.text, chunk_index=r.index, score=r.score) for r in results
+        ],
+    )

@@ -12,7 +12,7 @@ from __future__ import annotations
 import logging
 from typing import TYPE_CHECKING
 
-from app.chunkStoreFactory import buildChunkStore
+from app.chunkStoreFactory import getChunkStore
 from app.documents import analyze, download, extractText
 from app.ragIngestionPipeline import RagIngestionPipeline
 from app.ragSelector import RagSelector
@@ -37,7 +37,9 @@ class RagIngestionProcessor:
         pipeline: RagIngestionPipeline | None = None,
     ) -> None:
         self.selector = selector or RagSelector()
-        self.pipeline = pipeline or RagIngestionPipeline(buildChunkStore())
+        # The store search reads from, not a second instance of it -- writing
+        # to one store and searching another would find nothing.
+        self.pipeline = pipeline or RagIngestionPipeline(getChunkStore())
 
     async def process(self, job: "Job") -> None:
         data, filename, contentType = await download(job.documentLink)

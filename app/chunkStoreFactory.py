@@ -14,6 +14,7 @@ all without the flag.
 from __future__ import annotations
 
 import logging
+from functools import lru_cache
 
 from app.localChunkStore import LocalChunkStore, testModeEnabled
 from app.pineconeChunkStore import PineconeChunkStore
@@ -29,3 +30,15 @@ def buildChunkStore() -> ChunkStore:
         logger.warning("RAG_TEST_MODE is on -- ingesting to the local chunk store, not Pinecone.")
         return LocalChunkStore()
     return PineconeChunkStore()
+
+
+@lru_cache(maxsize=1)
+def getChunkStore() -> ChunkStore:
+    """FastAPI dependency: the process-wide chunk store.
+
+    One instance for the life of the process, same pattern as JOB_MANAGER --
+    ingestion writes to it and search reads from it, and those have to be the
+    same store or a search would look somewhere nothing was ever written.
+    Built lazily so importing this module needs no credentials.
+    """
+    return buildChunkStore()

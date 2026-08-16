@@ -84,5 +84,33 @@ class JobStatusResponse(CamelModel):
     document_link: str | None = None
 
 
+class SearchRequest(CamelModel):
+    model_config = ConfigDict(
+        alias_generator=to_camel,
+        populate_by_name=True,
+        extra="forbid",
+    )
+
+    server_id: str = Field(min_length=1, max_length=128)
+    server_secret: SecretStr = Field(min_length=1, max_length=512)
+    rag_db_id: str = Field(min_length=1, max_length=128)
+    query: str = Field(min_length=1, max_length=4000)
+    # Capped so one request cannot ask for a whole database back.
+    top_k: int = Field(default=5, ge=1, le=50)
+
+
+class SearchHit(CamelModel):
+    text: str
+    chunk_index: int
+    # Comparable within one response, not across stores: Pinecone scores are
+    # embedding similarities, the offline store's are keyword overlap.
+    score: float
+
+
+class SearchResponse(CamelModel):
+    rag_db_id: str
+    hits: list[SearchHit]
+
+
 class ErrorResponse(CamelModel):
     detail: str
