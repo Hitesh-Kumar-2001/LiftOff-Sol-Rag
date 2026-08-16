@@ -36,14 +36,14 @@ def testANewJobIsQueuedAndReturnedImmediately() -> None:
     async def scenario() -> None:
         manager = JobManager(StubDocumentProcessor())
 
-        job = manager.create(
+        job = await manager.create(
             serverId="svc", documentLink="https://example.com/doc.pdf", ragDbId="job-1"
         )
 
         assert job.serverId == "svc"
         assert job.documentLink == "https://example.com/doc.pdf"
         assert job.jobId
-        assert manager.get(job.jobId) is job
+        assert await manager.get(job.jobId) is job
 
     asyncio.run(scenario())
 
@@ -52,8 +52,10 @@ def testJobIdsDoNotCollide() -> None:
     async def scenario() -> None:
         manager = JobManager(StubDocumentProcessor())
         return {
-            manager.create(
-                serverId="svc", documentLink="https://example.com/a", ragDbId=f"job-{i}"
+            (
+                await manager.create(
+                    serverId="svc", documentLink="https://example.com/a", ragDbId=f"job-{i}"
+                )
             ).jobId
             for i in range(50)
         }
@@ -64,15 +66,18 @@ def testJobIdsDoNotCollide() -> None:
 
 
 def testAnUnknownJobIdIsNotFound() -> None:
-    manager = JobManager(StubDocumentProcessor())
+    async def scenario() -> None:
+        manager = JobManager(StubDocumentProcessor())
 
-    assert manager.get("does-not-exist") is None
+        assert await manager.get("does-not-exist") is None
+
+    asyncio.run(scenario())
 
 
 def testTheStubProcessorMarksAJobDoneInTheBackground() -> None:
     async def scenario() -> Job:
         manager = JobManager(StubDocumentProcessor())
-        job = manager.create(
+        job = await manager.create(
             serverId="svc", documentLink="https://example.com/doc.pdf", ragDbId="job-done"
         )
         await _waitUntil(lambda: job.status == JobStatus.DONE)
@@ -87,7 +92,7 @@ def testAJobIsProcessingBeforeItCompletes() -> None:
     async def scenario() -> None:
         processor = BlockingProcessor()
         manager = JobManager(processor)
-        job = manager.create(
+        job = await manager.create(
             serverId="svc", documentLink="https://example.com/doc.pdf", ragDbId="job-processing"
         )
 
@@ -103,7 +108,7 @@ def testAJobIsProcessingBeforeItCompletes() -> None:
 def testAFailingProcessorMarksTheJobFailed() -> None:
     async def scenario() -> Job:
         manager = JobManager(FailingProcessor())
-        job = manager.create(
+        job = await manager.create(
             serverId="svc", documentLink="https://example.com/doc.pdf", ragDbId="job-failed"
         )
         await _waitUntil(lambda: job.status == JobStatus.FAILED)
@@ -121,7 +126,7 @@ def testShutdownWaitsForJobsStillInFlight() -> None:
     async def scenario() -> None:
         processor = BlockingProcessor()
         manager = JobManager(processor)
-        job = manager.create(
+        job = await manager.create(
             serverId="svc", documentLink="https://example.com/doc.pdf", ragDbId="job-shutdown"
         )
 
@@ -150,9 +155,9 @@ def testResubmittingTheSameDocumentReusesItsJob() -> None:
         processor = BlockingProcessor()
         manager = JobManager(processor)
 
-        first = manager.create(serverId="svc", documentLink=LINK, ragDbId="handbook")
+        first = await manager.create(serverId="svc", documentLink=LINK, ragDbId="handbook")
         await processor.started.wait()
-        second = manager.create(serverId="svc", documentLink=LINK, ragDbId="handbook")
+        second = await manager.create(serverId="svc", documentLink=LINK, ragDbId="handbook")
 
         assert second is first
         assert len(manager._tasks) == 1, "a second ingestion was started"
@@ -170,11 +175,11 @@ def testADifferentDocumentIsRefusedWhileOneIsStillIngesting() -> None:
     async def scenario() -> None:
         processor = BlockingProcessor()
         manager = JobManager(processor)
-        manager.create(serverId="svc", documentLink=LINK, ragDbId="handbook")
+        await manager.create(serverId="svc", documentLink=LINK, ragDbId="handbook")
         await processor.started.wait()
 
         with pytest.raises(JobConflictError):
-            manager.create(serverId="svc", documentLink=OTHER_LINK, ragDbId="handbook")
+            await manager.create(serverId="svc", documentLink=OTHER_LINK, ragDbId="handbook")
 
         processor.release.set()
 
@@ -186,13 +191,13 @@ def testADifferentDocumentReplacesAFinishedOne() -> None:
 
     async def scenario() -> None:
         manager = JobManager(StubDocumentProcessor())
-        first = manager.create(serverId="svc", documentLink=LINK, ragDbId="handbook")
+        first = await manager.create(serverId="svc", documentLink=LINK, ragDbId="handbook")
         await _waitUntil(lambda: first.status == JobStatus.DONE)
 
-        second = manager.create(serverId="svc", documentLink=OTHER_LINK, ragDbId="handbook")
+        second = await manager.create(serverId="svc", documentLink=OTHER_LINK, ragDbId="handbook")
 
         assert second is not first
-        assert manager.get("handbook") is second
+        assert await manager.get("handbook") is second
 
     asyncio.run(scenario())
 
@@ -200,10 +205,10 @@ def testADifferentDocumentReplacesAFinishedOne() -> None:
 def testAFailedJobIsRetriedRatherThanReused() -> None:
     async def scenario() -> None:
         manager = JobManager(FailingProcessor())
-        first = manager.create(serverId="svc", documentLink=LINK, ragDbId="handbook")
+        first = await manager.create(serverId="svc", documentLink=LINK, ragDbId="handbook")
         await _waitUntil(lambda: first.status == JobStatus.FAILED)
 
-        second = manager.create(serverId="svc", documentLink=LINK, ragDbId="handbook")
+        second = await manager.create(serverId="svc", documentLink=LINK, ragDbId="handbook")
 
         assert second is not first
 
@@ -216,11 +221,11 @@ def testAnotherServerSubmittingTheSameLinkIsNotTreatedAsADuplicate() -> None:
     async def scenario() -> None:
         processor = BlockingProcessor()
         manager = JobManager(processor)
-        manager.create(serverId="svc", documentLink=LINK, ragDbId="handbook")
+        await manager.create(serverId="svc", documentLink=LINK, ragDbId="handbook")
         await processor.started.wait()
 
         with pytest.raises(JobConflictError):
-            manager.create(serverId="other", documentLink=LINK, ragDbId="handbook")
+            await manager.create(serverId="other", documentLink=LINK, ragDbId="handbook")
 
         processor.release.set()
 
@@ -231,10 +236,10 @@ def testDifferentDatabasesNeverConflict() -> None:
     async def scenario() -> None:
         processor = BlockingProcessor()
         manager = JobManager(processor)
-        manager.create(serverId="svc", documentLink=LINK, ragDbId="handbook")
+        await manager.create(serverId="svc", documentLink=LINK, ragDbId="handbook")
         await processor.started.wait()
 
-        manager.create(serverId="svc", documentLink=OTHER_LINK, ragDbId="policies")
+        await manager.create(serverId="svc", documentLink=OTHER_LINK, ragDbId="policies")
 
         assert len(manager) == 2
         processor.release.set()

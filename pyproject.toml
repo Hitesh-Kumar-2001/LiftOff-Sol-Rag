@@ -13,11 +13,18 @@ dependencies = [
     "google-genai>=1.5.0",
     "pinecone>=5.0.0",
     "python-dotenv>=1.0.0",
+    "firebase-admin>=6.4.0",
+    "celery>=5.4",
+    "redis>=5.0",
 ]
 
 [dependency-groups]
 dev = [
     "pytest>=9.1.1",
+    # Only for scripts/liveCeleryCheck.py, which runs its broker on kombu's
+    # filesystem transport; that transport locks its spool files through
+    # pywin32. No production broker needs it.
+    'pywin32>=306; sys_platform == "win32"',
 ]
 
 [tool.pytest.ini_options]

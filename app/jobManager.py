@@ -8,16 +8,34 @@ keeps the result reachable, and is what routes.py depends on.
 
 import asyncio
 import logging
+import os
 
 from app.documents import DocumentProcessor
-from app.jobs import Job, JobStatus, runJob
+from app.jobs import (
+    Job,
+    JobConflictError,
+    JobDispatchError,
+    Submission,
+    conflictError,
+    resolveSubmission,
+    runJob,
+)
 from app.ragProcessor import RagIngestionProcessor
+
+# Re-exported: routes.py and the tests import these from here, and they are
+# defined in app.jobs so that every job manager raises the same classes.
+__all__ = ["JobConflictError", "JobDispatchError", "JobManager", "getJobManager"]
 
 logger = logging.getLogger(__name__)
 
+# Firestore is used when a GCP project is named for it -- not merely when
+# credentials happen to be present, since a machine can have application
+# default credentials for unrelated reasons.
+_USE_FIREBASE = bool(os.environ.get("GCP_PROJECT_ID"))
 
-class JobConflictError(Exception):
-    """A different document is already being ingested into this ragDbId."""
+# Likewise: a broker URL is what says ingestion should be dispatched rather
+# than run here.
+_USE_CELERY = bool(os.environ.get("CELERY_BROKER_URL"))
 
 
 class JobManager:
@@ -27,23 +45,10 @@ class JobManager:
     single node; revisit if a queued job needs to survive a deploy.
 
     A job's id is its ``ragDbId`` (see ``Job.jobId``), so every submission for
-    one database lands on one job. What a second submission means depends on
-    whether it is the same work:
-
-    * the same document again -- a retry, a duplicate delivery, an impatient
-      caller -- returns the existing job untouched. Ingesting it twice would
-      cost the same money to produce the same records.
-    * a *different* document, while the first is still running, is refused.
-      Both jobs write to one database under ids derived from chunk position,
-      so whichever finishes last silently overwrites part of the other and
-      leaves the database holding half of each. There is no safe way to run
-      them at once, and cancelling the first has no safe halfway point to
-      stop at either.
-    * a different document once nothing is running replaces what is there,
-      which is the ordinary way to re-ingest a database.
-
-    A failed job is never reused -- resubmitting the same document after a
-    failure retries it.
+    one database lands on one job. What a second submission for that id means
+    -- reuse, conflict, or a fresh job -- is ``app.jobs.resolveSubmission``,
+    shared with the Firestore and Celery managers so the three cannot answer
+    it differently.
     """
 
     def __init__(self, processor: DocumentProcessor) -> None:
@@ -54,22 +59,24 @@ class JobManager:
     def __len__(self) -> int:
         return len(self._jobs)
 
-    def create(self, *, serverId: str, documentLink: str, ragDbId: str) -> Job:
+    async def create(self, *, serverId: str, documentLink: str, ragDbId: str) -> Job:
         """Record a queued job under ``ragDbId`` and run it in the background.
 
         Raises ``JobConflictError`` if a different document is mid-ingest into
         the same database.
+
+        Nothing here blocks -- it is a dict write. Async only so that this and
+        the managers backed by Firestore and Celery, which do block on network
+        calls and have to get off the event loop to do it, present one
+        interface to routes.py.
         """
         existing = self._jobs.get(ragDbId)
-        if existing is not None and existing.status is not JobStatus.FAILED:
-            if (existing.documentLink, existing.serverId) == (documentLink, serverId):
-                logger.info("Reusing job '%s'; same document already submitted.", ragDbId)
-                return existing
-            if existing.status in (JobStatus.QUEUED, JobStatus.PROCESSING):
-                raise JobConflictError(
-                    f"'{existing.documentLink}' is already being ingested into "
-                    f"'{ragDbId}'. Wait for it to finish before submitting another."
-                )
+        outcome = resolveSubmission(existing, serverId=serverId, documentLink=documentLink)
+        if outcome is Submission.REUSE:
+            logger.info("Reusing job '%s'; same document already submitted.", ragDbId)
+            return existing
+        if outcome is Submission.CONFLICT:
+            raise conflictError(existing, ragDbId)
 
         job = Job(jobId=ragDbId, serverId=serverId, documentLink=documentLink)
         self._jobs[job.jobId] = job
@@ -82,7 +89,7 @@ class JobManager:
 
         return job
 
-    def get(self, jobId: str) -> Job | None:
+    async def get(self, jobId: str) -> Job | None:
         return self._jobs.get(jobId)
 
     async def shutdown(self) -> None:
@@ -100,10 +107,68 @@ class JobManager:
             await asyncio.gather(*tasks, return_exceptions=True)
 
 
-# One manager for the life of the process, same pattern as SERVER_REGISTRY.
-JOB_MANAGER = JobManager(RagIngestionProcessor())
+def buildJobManager():
+    """Pick the job manager from the environment.
+
+    Three combinations, in order of how much they can survive:
+
+    * broker + project -- Firestore holds the jobs, Celery workers run them.
+    * project only -- Firestore holds the jobs, this process runs them.
+    * neither -- a dict in this process holds them and runs them.
+
+    Deliberately not a silent fallback. A misconfigured deployment that
+    quietly reverted to the in-memory manager would look healthy while losing
+    every job to the next restart and dropping the conflict check between
+    instances -- the exact failures the other two exist to prevent. Better to
+    refuse to start.
+    """
+    if _USE_CELERY:
+        if not _USE_FIREBASE:
+            # A broker moves the work to another process, so the job table has
+            # to be reachable from both. With the in-memory table the API
+            # would write a job the worker cannot see, the worker's status
+            # writes would land nowhere the API reads, and /document/status
+            # would answer 404 for every job actually running -- while the
+            # whole thing looked configured and healthy.
+            raise RuntimeError(
+                "CELERY_BROKER_URL is set without GCP_PROJECT_ID. Dispatching to a "
+                "worker needs a job table both processes can read; set GCP_PROJECT_ID "
+                "(and GOOGLE_APPLICATION_CREDENTIALS outside GCP) to use Firestore, "
+                "or unset CELERY_BROKER_URL to run ingestion in this process."
+            )
+        from app.celeryApp import HARD_TIME_LIMIT_SECONDS
+        from app.celeryJobManager import CeleryJobManager
+        from app.firestoreJobStore import FirestoreJobStore
+
+        # Only here is reclaiming a stuck job safe. Celery's hard time limit
+        # kills a task outright, so nothing can still be running past it, and a
+        # job left QUEUED or PROCESSING well beyond it has definitively lost
+        # its worker -- otherwise its ragDbId is blocked by a 409 forever, with
+        # no restart to clear it now that the table outlives the process. The
+        # margin is generous on purpose: reclaiming too early would start a
+        # second ingestion alongside a live one. See resolveSubmission.
+        staleAfter = float(
+            os.environ.get("RAG_STALE_JOB_SECONDS", 2 * HARD_TIME_LIMIT_SECONDS)
+        )
+        logger.info("Using the Celery job manager; ingestion runs on workers.")
+        return CeleryJobManager(
+            RagIngestionProcessor(), FirestoreJobStore(staleAfterSeconds=staleAfter)
+        )
+
+    if _USE_FIREBASE:
+        from app.firestoreJobManager import FirestoreJobManager
+
+        logger.info("Using the Firestore job manager; ingestion runs in this process.")
+        return FirestoreJobManager(RagIngestionProcessor())
+
+    logger.info("Using the in-memory job manager; jobs will not survive a restart.")
+    return JobManager(RagIngestionProcessor())
 
 
-def getJobManager() -> JobManager:
+# One manager for the life of the process.
+JOB_MANAGER = buildJobManager()
+
+
+def getJobManager():
     """FastAPI dependency: the process-wide job manager."""
     return JOB_MANAGER

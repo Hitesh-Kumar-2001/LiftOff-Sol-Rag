@@ -4,7 +4,7 @@ from typing import Annotated
 
 from fastapi import APIRouter, Depends, HTTPException, status
 
-from app.jobManager import JobConflictError, JobManager, getJobManager
+from app.jobManager import JobConflictError, JobDispatchError, JobManager, getJobManager
 from app.ragIngestionPipeline import ChunkingStrategy
 from app.chunkStoreFactory import getChunkStore
 from app.ragIngestionPipeline import ChunkStore
@@ -72,6 +72,10 @@ async def query(
             "model": ErrorResponse,
             "description": "A different document is already being ingested into this ragDbId",
         },
+        503: {
+            "model": ErrorResponse,
+            "description": "The queue was unreachable; nothing was started, so resubmit as-is",
+        },
     },
 )
 async def submitDocument(
@@ -91,7 +95,7 @@ async def submitDocument(
     _requireServer(registry, payload.server_id, payload.server_secret.get_secret_value())
 
     try:
-        job = jobs.create(
+        job = await jobs.create(
             serverId=payload.server_id,
             documentLink=payload.document_link,
             ragDbId=payload.rag_db_id,
@@ -100,6 +104,12 @@ async def submitDocument(
         # Not a 202: nothing was queued, and running it anyway would leave the
         # database holding half of each document.
         raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(exc)) from None
+    except JobDispatchError as exc:
+        # The request was fine; the queue behind it was not. A 503 says
+        # "resubmit this exact request later", which a 500 does not.
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail=str(exc)
+        ) from None
 
     return JobResponse(job_id=job.jobId, status=job.status.value)
 
@@ -127,14 +137,15 @@ async def documentStatus(
     carries them there, and a GET would put a secret in a query string, where
     it lands in access logs and browser history.
 
-    Jobs live in memory, so a ragDbId ingested before the last restart reads
-    as 404 rather than as done. That distinction matters to a caller deciding
-    whether to resubmit, which is why an unknown id is not reported as some
-    'unknown' status.
+    An unknown ragDbId is a 404 rather than some 'unknown' status: that
+    distinction is what a caller needs to decide whether to resubmit. How long
+    an id stays known depends on where the job table lives -- in memory it is
+    until the next restart, in Firestore it is indefinitely (see the job
+    manager selected in app.jobManager).
     """
     _requireServer(registry, payload.server_id, payload.server_secret.get_secret_value())
 
-    job = jobs.get(payload.rag_db_id)
+    job = await jobs.get(payload.rag_db_id)
     if job is None:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,

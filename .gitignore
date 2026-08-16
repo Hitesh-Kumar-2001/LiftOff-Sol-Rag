@@ -11,3 +11,11 @@ __pycache__/
 .localChunkStore/
 tests/data/.localStore/
 
+# Secrets: service account keys, API keys, credentials -- NEVER commit.
+# Scoped deliberately: a bare *.json would also hide legitimate config.
+keys/
+*serviceAccount*.json
+*-adminsdk-*.json
+*credentials*.json
+.env.local
+

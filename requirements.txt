@@ -12,3 +12,10 @@ tiktoken>=0.13.0
 google-genai>=1.5.0
 pinecone>=5.0.0
 python-dotenv>=1.0.0
+# The job table (app.firestoreJobStore).
+firebase-admin>=6.4.0
+# Dispatching ingestion to workers (app.celeryApp). redis is the broker
+# client; swapping in RabbitMQ means amqp here and a different broker URL,
+# and no code change.
+celery>=5.4
+redis>=5.0
