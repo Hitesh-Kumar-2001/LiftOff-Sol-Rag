@@ -17,6 +17,7 @@ import json
 import logging
 import os
 import re
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from enum import Enum, auto
 from functools import lru_cache
@@ -42,6 +43,14 @@ TOKEN_ENCODING_NAME = "cl100k_base"
 
 DEFAULT_CHUNK_TOKENS = 400
 DEFAULT_CHUNK_OVERLAP_TOKENS = 40
+
+# The smallest input window among the embedders we target: Pinecone's
+# llama-text-embed-v2 caps at 2048 tokens and, by default, truncates from the
+# END rather than refusing -- an oversized chunk loses its tail with no error
+# anywhere. Nothing upstream guarantees a chunk fits: RAW stores a document
+# whole, and the AI chunker is *asked* for a size but can return anything.
+# enforceEmbedLimit below is what actually makes it true.
+MAX_EMBED_TOKENS = int(os.environ.get("RAG_MAX_EMBED_TOKENS", "2048"))
 
 AI_CHUNK_PROMPT = (
     "Split the TEXT below into self-contained semantic chunks. Each chunk "
@@ -137,6 +146,34 @@ def chunkWithoutAi(
     return chunks
 
 
+def enforceEmbedLimit(chunks: list[str]) -> list[str]:
+    """Re-split anything an embedder would silently truncate.
+
+    A last line of defence rather than the main chunking step: whatever
+    strategy produced these, a chunk over the limit reaches the store as a
+    record whose tail is dropped on the way in, and nothing downstream can
+    tell that happened.
+    """
+    limited: list[str] = []
+    for chunk in chunks:
+        if countTokens(chunk) <= MAX_EMBED_TOKENS:
+            limited.append(chunk)
+            continue
+        logger.warning(
+            "Chunk of %d tokens exceeds the %d-token embed limit; re-splitting.",
+            countTokens(chunk),
+            MAX_EMBED_TOKENS,
+        )
+        limited.extend(
+            chunkWithoutAi(
+                [chunk],
+                chunkTokens=MAX_EMBED_TOKENS,
+                overlapTokens=DEFAULT_CHUNK_OVERLAP_TOKENS,
+            )
+        )
+    return limited
+
+
 @lru_cache(maxsize=1)
 def geminiClient() -> genai.Client:
     apiKey = os.environ.get(ENV_GEMINI_API_KEY)
@@ -185,13 +222,19 @@ def parseAiChunks(raw: str | None) -> list[str]:
 
 
 class ChunkStore(Protocol):
-    """Where finished chunks end up, keyed by ``ragDbId``. In-memory for now;
-    a real DB slots in here later without the pipeline above needing to
-    change."""
+    """Where finished chunks end up, keyed by ``ragDbId``.
+
+    Three implementations exist: ``InMemoryChunkStore`` here,
+    ``app.localChunkStore.LocalChunkStore`` for tests, and
+    ``app.pineconeChunkStore.PineconeChunkStore`` for real use. Nothing in
+    this module knows which one it has.
+    """
 
     async def save(self, ragDbId: str, chunks: list[Chunk]) -> None: ...
 
     async def get(self, ragDbId: str) -> list[Chunk]: ...
+
+    async def delete(self, ragDbId: str) -> None: ...
 
 
 class InMemoryChunkStore:
@@ -204,12 +247,23 @@ class InMemoryChunkStore:
     async def get(self, ragDbId: str) -> list[Chunk]:
         return self.byRagDbId.get(ragDbId, [])
 
+    async def delete(self, ragDbId: str) -> None:
+        self.byRagDbId.pop(ragDbId, None)
+
 
 class RagIngestionPipeline:
     """load -> split -> chunk -> store."""
 
-    def __init__(self, store: ChunkStore | None = None) -> None:
+    def __init__(
+        self,
+        store: ChunkStore | None = None,
+        aiChunker: Callable[[list[str]], Awaitable[list[str]]] | None = None,
+    ) -> None:
         self.store = store or InMemoryChunkStore()
+        # Injectable so a test can exercise the AI *path* -- selection,
+        # chunking, storage -- without a per-section call to a paid API for
+        # every section of a million-token corpus.
+        self.aiChunker = aiChunker or chunkWithAi
 
     async def run(
         self,
@@ -246,10 +300,14 @@ class RagIngestionPipeline:
         return IngestedDocument(ragDbId=ragDbId, sourceUrl=sourceUrl, chunks=chunks)
 
     async def chunk(self, text: str, strategy: ChunkingStrategy) -> list[str]:
+        chunks = await self.chunkBy(text, strategy)
+        return enforceEmbedLimit(chunks)
+
+    async def chunkBy(self, text: str, strategy: ChunkingStrategy) -> list[str]:
         if strategy is ChunkingStrategy.RAW:
             return [text.strip()] if text.strip() else []
 
         sections = split(text)
         if strategy is ChunkingStrategy.AI:
-            return await chunkWithAi(sections)
+            return await self.aiChunker(sections)
         return chunkWithoutAi(sections)

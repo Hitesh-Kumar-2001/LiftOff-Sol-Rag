@@ -14,6 +14,7 @@ import os
 from functools import lru_cache
 
 from pinecone import Pinecone
+from pinecone.exceptions import NotFoundException
 
 from app.ragIngestionPipeline import Chunk, IngestionError
 
@@ -106,3 +107,19 @@ class PineconeChunkStore:
         ]
         chunks.sort(key=lambda c: c.index)
         return chunks
+
+    async def delete(self, ragDbId: str) -> None:
+        """Drop every chunk stored for ``ragDbId``.
+
+        Deleting the whole namespace rather than the ids in it: the namespace
+        holds nothing else, and a namespace that was never written to is not
+        an error worth raising -- Pinecone reports that as a 404, which here
+        just means there was nothing to delete.
+        """
+        await self.ensureIndex()
+        try:
+            await asyncio.to_thread(
+                self.index.delete, delete_all=True, namespace=namespaceFor(ragDbId)
+            )
+        except NotFoundException:
+            pass

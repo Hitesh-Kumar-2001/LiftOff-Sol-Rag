@@ -7,3 +7,7 @@ __pycache__/
 .idea/
 .vscode/
 
+# Local (test-mode) chunk storage -- never source, always regenerated.
+.localChunkStore/
+tests/data/.localStore/
+

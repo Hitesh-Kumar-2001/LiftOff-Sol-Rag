@@ -12,8 +12,8 @@ from __future__ import annotations
 import logging
 from typing import TYPE_CHECKING
 
+from app.chunkStoreFactory import buildChunkStore
 from app.documents import analyze, download, extractText
-from app.pineconeChunkStore import PineconeChunkStore
 from app.ragIngestionPipeline import RagIngestionPipeline
 from app.ragSelector import RagSelector
 
@@ -37,7 +37,7 @@ class RagIngestionProcessor:
         pipeline: RagIngestionPipeline | None = None,
     ) -> None:
         self.selector = selector or RagSelector()
-        self.pipeline = pipeline or RagIngestionPipeline(PineconeChunkStore())
+        self.pipeline = pipeline or RagIngestionPipeline(buildChunkStore())
 
     async def process(self, job: "Job") -> None:
         data, filename, contentType = await download(job.documentLink)

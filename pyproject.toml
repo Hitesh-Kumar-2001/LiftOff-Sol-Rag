@@ -22,3 +22,6 @@ dev = [
 
 [tool.pytest.ini_options]
 python_files = ["test*.py"]
+markers = [
+    "slow: parses the tests/data corpora end to end (~2 minutes). Skip with -m 'not slow'.",
+]
