@@ -5,13 +5,10 @@ import pytest
 from fastapi.testclient import TestClient
 
 from app.chunkStoreFactory import getChunkStore
-from app.credentials import InMemoryCredentialSource, ServerCredential, hashSecret
 from app.localChunkStore import ENV_TEST_MODE, LocalChunkStore
 from app.main import app
+from app.projectStore import InMemoryProjectStore, getProjectStore
 from app.ragIngestionPipeline import Chunk, lexicalSearch
-from app.security import ServerRegistry, getServerRegistry
-
-SECRET = "s3cr3t-api-key"
 
 CHUNKS = [
     Chunk(text="Refunds are issued within 30 days of purchase.", index=0, tokenCount=9),
@@ -23,18 +20,18 @@ CHUNKS = [
 @pytest.fixture
 def client(tmp_path, monkeypatch) -> Iterator[TestClient]:
     monkeypatch.setenv(ENV_TEST_MODE, "1")
-    registry = ServerRegistry(
-        InMemoryCredentialSource(
-            [ServerCredential(serverId="billing-service", secretHash=hashSecret(SECRET))]
-        )
-    )
-    asyncio.run(registry.loadAll())
+    projectStore = InMemoryProjectStore()
+    # The chunks are stored under the ragDbId the route will resolve to, not
+    # under the project id. Storing them by project id would pass only because
+    # the two happened to be the same string -- exactly the assumption this
+    # indirection exists to break.
+    ragDbId = asyncio.run(projectStore.resolveOrCreate("handbook"))
 
     store = LocalChunkStore(root=tmp_path)
-    asyncio.run(store.save("handbook", CHUNKS))
+    asyncio.run(store.save(ragDbId, CHUNKS))
 
-    app.dependency_overrides[getServerRegistry] = lambda: registry
     app.dependency_overrides[getChunkStore] = lambda: store
+    app.dependency_overrides[getProjectStore] = lambda: projectStore
     with TestClient(app) as testClient:
         yield testClient
     app.dependency_overrides.clear()
@@ -43,8 +40,7 @@ def client(tmp_path, monkeypatch) -> Iterator[TestClient]:
 def body(**overrides) -> dict:
     payload = {
         "serverId": "billing-service",
-        "serverSecret": SECRET,
-        "ragDbId": "handbook",
+        "projectId": "handbook",
         "query": "refund",
     }
     return payload | overrides
@@ -55,7 +51,7 @@ def testAQueryReturnsTheMatchingChunk(client: TestClient) -> None:
 
     assert response.status_code == 200
     payload = response.json()
-    assert payload["ragDbId"] == "handbook"
+    assert payload["projectId"] == "handbook"
     assert payload["hits"], "expected at least one hit"
     assert "Refunds are issued" in payload["hits"][0]["text"]
 
@@ -89,28 +85,35 @@ def testAQueryMatchingNothingReturnsNoHits(client: TestClient) -> None:
 def testAnUningestedDatabaseReturnsNoHits(client: TestClient) -> None:
     """Nothing was stored under this id, which is the same answer as nothing
     matching -- not a 404."""
-    response = client.post("/api/v1/search", json=body(ragDbId="never-ingested"))
+    response = client.post("/api/v1/search", json=body(projectId="never-ingested"))
 
     assert response.status_code == 200
     assert response.json()["hits"] == []
 
 
-def testWrongSecretIsRejected(client: TestClient) -> None:
-    assert client.post("/api/v1/search", json=body(serverSecret="wrong")).status_code == 401
+def testSearchingAnUnknownProjectCreatesNoDatabase(client: TestClient) -> None:
+    """Only /document may mint a database. If searching did too, every mistyped
+    projectId would leave an empty one behind forever."""
+    projects = app.dependency_overrides[getProjectStore]()
+
+    client.post("/api/v1/search", json=body(projectId="mistyped"))
+
+    assert asyncio.run(projects.resolve("mistyped")) is None
 
 
-def testUnknownServerIsRejected(client: TestClient) -> None:
-    assert client.post("/api/v1/search", json=body(serverId="nobody")).status_code == 401
+def testTheInternalRagDbIdIsNeverReturned(client: TestClient) -> None:
+    """The caller gets back the project it asked about, not where the chunks
+    turned out to live."""
+    ragDbId = asyncio.run(app.dependency_overrides[getProjectStore]().resolve("handbook"))
+
+    response = client.post("/api/v1/search", json=body(query="refunds purchase"))
+
+    assert response.json()["projectId"] == "handbook"
+    assert response.json()["hits"], "expected the search to have actually matched"
+    assert ragDbId not in response.text
 
 
-def testSearchDoesNotRunForAnUnverifiedServer(client: TestClient) -> None:
-    """Authentication comes first, so a bad caller cannot read chunks."""
-    response = client.post("/api/v1/search", json=body(serverSecret="wrong"))
-
-    assert "Refunds are issued" not in response.text
-
-
-@pytest.mark.parametrize("field", ["serverId", "serverSecret", "ragDbId", "query"])
+@pytest.mark.parametrize("field", ["serverId", "projectId", "query"])
 def testEveryFieldIsRequired(client: TestClient, field: str) -> None:
     payload = body()
     del payload[field]
@@ -118,7 +121,7 @@ def testEveryFieldIsRequired(client: TestClient, field: str) -> None:
     assert client.post("/api/v1/search", json=payload).status_code == 422
 
 
-@pytest.mark.parametrize("field", ["serverId", "serverSecret", "ragDbId", "query"])
+@pytest.mark.parametrize("field", ["serverId", "projectId", "query"])
 def testBlankFieldsAreRejected(client: TestClient, field: str) -> None:
     assert client.post("/api/v1/search", json=body(**{field: ""})).status_code == 422
 
@@ -130,10 +133,6 @@ def testAnOutOfRangeTopKIsRejected(client: TestClient, topK: int) -> None:
 
 def testUnexpectedFieldsAreRejected(client: TestClient) -> None:
     assert client.post("/api/v1/search", json=body(role="admin")).status_code == 422
-
-
-def testTheSecretIsNeverEchoedBack(client: TestClient) -> None:
-    assert "wrong" not in client.post("/api/v1/search", json=body(serverSecret="wrong")).text
 
 
 def testLongerChunksDoNotOutrankFocusedOnesOnLengthAlone() -> None:

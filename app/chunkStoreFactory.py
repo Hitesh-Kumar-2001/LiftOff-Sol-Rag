@@ -1,8 +1,8 @@
 """Which ``ChunkStore`` this process ingests into.
 
-The same shape as ``app.credentials.buildCredentialSource``: one place picks
-the implementation from the environment, so nothing else has to know that
-more than one exists.
+The same shape as ``app.projectStore.buildProjectStore``: one place picks the
+implementation from the environment, so nothing else has to know that more
+than one exists.
 
 Test mode is opt-in and never the default. A process that has not set
 ``RAG_TEST_MODE`` ingests into Pinecone -- there is no configuration

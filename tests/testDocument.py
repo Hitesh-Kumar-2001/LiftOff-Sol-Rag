@@ -5,14 +5,11 @@ from contextlib import contextmanager
 import pytest
 from fastapi.testclient import TestClient
 
-from app.credentials import InMemoryCredentialSource, ServerCredential, hashSecret
 from app.documents import StubDocumentProcessor
 from app.jobManager import JobManager, getJobManager
 from app.jobs import Job
 from app.main import app
-from app.security import ServerRegistry, getServerRegistry
-
-SECRET = "s3cr3t-api-key"
+from app.projectStore import InMemoryProjectStore, getProjectStore
 
 
 class BlockingProcessor:
@@ -24,19 +21,17 @@ class BlockingProcessor:
 
 @contextmanager
 def clientUsing(processor) -> Generator[TestClient]:
-    registry = ServerRegistry(
-        InMemoryCredentialSource(
-            [ServerCredential(serverId="billing-service", secretHash=hashSecret(SECRET))]
-        )
-    )
-    asyncio.run(registry.loadAll())
-
     # One manager per test, not one per request -- a fresh instance per call
     # would make jobs vanish between the create and any later lookup.
     jobManager = JobManager(processor)
+    # Likewise one mapping per test, and a fresh one each time: the real store
+    # is a process-wide singleton, so without this a projectId minted by one
+    # test would still resolve in the next -- and "never submitted" would stop
+    # meaning that.
+    projectStore = InMemoryProjectStore()
 
-    app.dependency_overrides[getServerRegistry] = lambda: registry
     app.dependency_overrides[getJobManager] = lambda: jobManager
+    app.dependency_overrides[getProjectStore] = lambda: projectStore
     try:
         with TestClient(app) as testClient:
             yield testClient
@@ -53,43 +48,60 @@ def client() -> Iterator[TestClient]:
 def body(**overrides: str) -> dict[str, str]:
     payload = {
         "serverId": "billing-service",
-        "serverSecret": SECRET,
         "documentLink": "https://example.com/handbook.pdf",
-        "ragDbId": "handbook",
+        "projectId": "handbook",
     }
     return payload | overrides
 
 
-def testAVerifiedServerGetsAJobId(client: TestClient) -> None:
+def resolve(projectId: str) -> str | None:
+    """The ragDbId the API minted for ``projectId``, read straight from the
+    store the test installed."""
+    return asyncio.run(app.dependency_overrides[getProjectStore]().resolve(projectId))
+
+
+def testASubmissionGetsItsProjectIdBack(client: TestClient) -> None:
     response = client.post("/api/v1/document", json=body())
 
     assert response.status_code == 202
-    payload = response.json()
-    assert payload["jobId"]
-    assert payload["status"] == "queued"
+    assert response.json() == {"projectId": "handbook", "status": "queued"}
 
 
-def testEachRagDbIdGetsItsOwnJobId(client: TestClient) -> None:
-    first = client.post("/api/v1/document", json=body(ragDbId="handbook")).json()
-    second = client.post("/api/v1/document", json=body(ragDbId="policies")).json()
+def testTheInternalRagDbIdIsNeverReturned(client: TestClient) -> None:
+    """The point of the indirection: a caller ends up holding a projectId and
+    nothing that names where its chunks actually live."""
+    response = client.post("/api/v1/document", json=body())
 
-    assert first["jobId"] != second["jobId"]
+    ragDbId = resolve("handbook")
+    assert ragDbId is not None, "the submission should have minted a database"
+    assert ragDbId not in response.text
+    assert "ragDbId" not in response.text
 
 
-def testResubmittingARagDbIdReusesItsJobId(client: TestClient) -> None:
-    """A job's id *is* its ragDbId, so a second document for the same database
-    lands on the same job rather than creating a competing one."""
-    first = client.post("/api/v1/document", json=body(ragDbId="handbook")).json()
-    second = client.post("/api/v1/document", json=body(ragDbId="handbook")).json()
+def testEachProjectGetsItsOwnDatabase(client: TestClient) -> None:
+    client.post("/api/v1/document", json=body(projectId="handbook"))
+    client.post("/api/v1/document", json=body(projectId="policies"))
 
-    assert first["jobId"] == second["jobId"] == "handbook"
+    assert resolve("handbook") != resolve("policies")
+
+
+def testResubmittingAProjectReusesItsDatabase(client: TestClient) -> None:
+    """A project's ragDbId is minted once and never again. Minting a second
+    would strand the first document's chunks in a namespace nothing resolves
+    to -- still in Pinecone, still billable, unreachable by any request."""
+    client.post("/api/v1/document", json=body(projectId="handbook"))
+    first = resolve("handbook")
+
+    client.post("/api/v1/document", json=body(projectId="handbook"))
+
+    assert resolve("handbook") == first
 
 
 def testResubmittingTheSameDocumentIsAccepted(client: TestClient) -> None:
     """The stub finishes immediately, so this is the settled case: the same
     document again is a duplicate, not a conflict."""
-    first = client.post("/api/v1/document", json=body(ragDbId="handbook"))
-    second = client.post("/api/v1/document", json=body(ragDbId="handbook"))
+    first = client.post("/api/v1/document", json=body(projectId="handbook"))
+    second = client.post("/api/v1/document", json=body(projectId="handbook"))
 
     assert first.status_code == second.status_code == 202
 
@@ -98,11 +110,11 @@ def testADifferentDocumentMidIngestIsAConflict() -> None:
     """409 rather than 202: nothing was queued, because running it would
     leave the database holding part of each document."""
     with clientUsing(BlockingProcessor()) as client:
-        client.post("/api/v1/document", json=body(ragDbId="handbook"))
+        client.post("/api/v1/document", json=body(projectId="handbook"))
 
         response = client.post(
             "/api/v1/document",
-            json=body(ragDbId="handbook", documentLink="https://example.com/other.pdf"),
+            json=body(projectId="handbook", documentLink="https://example.com/other.pdf"),
         )
 
         assert response.status_code == 409
@@ -111,31 +123,19 @@ def testADifferentDocumentMidIngestIsAConflict() -> None:
 
 def testAConflictQueuesNothing() -> None:
     with clientUsing(BlockingProcessor()) as client:
-        client.post("/api/v1/document", json=body(ragDbId="handbook"))
+        client.post("/api/v1/document", json=body(projectId="handbook"))
         manager = app.dependency_overrides[getJobManager]()
         before = len(manager)
 
         client.post(
             "/api/v1/document",
-            json=body(ragDbId="handbook", documentLink="https://example.com/other.pdf"),
+            json=body(projectId="handbook", documentLink="https://example.com/other.pdf"),
         )
 
         assert len(manager) == before
 
 
-def testWrongSecretIsRejected(client: TestClient) -> None:
-    response = client.post("/api/v1/document", json=body(serverSecret="wrong"))
-
-    assert response.status_code == 401
-
-
-def testUnknownServerIsRejected(client: TestClient) -> None:
-    response = client.post("/api/v1/document", json=body(serverId="nobody"))
-
-    assert response.status_code == 401
-
-
-@pytest.mark.parametrize("field", ["serverId", "serverSecret", "documentLink", "ragDbId"])
+@pytest.mark.parametrize("field", ["serverId", "documentLink", "projectId"])
 def testEveryFieldIsRequired(client: TestClient, field: str) -> None:
     payload = body()
     del payload[field]
@@ -145,7 +145,7 @@ def testEveryFieldIsRequired(client: TestClient, field: str) -> None:
     assert response.status_code == 422
 
 
-@pytest.mark.parametrize("field", ["serverId", "serverSecret", "documentLink", "ragDbId"])
+@pytest.mark.parametrize("field", ["serverId", "documentLink", "projectId"])
 def testBlankFieldsAreRejected(client: TestClient, field: str) -> None:
     response = client.post("/api/v1/document", json=body(**{field: ""}))
 
@@ -158,41 +158,27 @@ def testUnexpectedFieldsAreRejected(client: TestClient) -> None:
     assert response.status_code == 422
 
 
-def testTheSecretIsNeverEchoedBack(client: TestClient) -> None:
-    response = client.post("/api/v1/document", json=body(serverSecret="wrong"))
-
-    assert "wrong" not in response.text
-
-
-@pytest.mark.parametrize("field", ["serverId", "documentLink", "ragDbId"])
-def testAValidationErrorNeverEchoesTheSecret(client: TestClient, field: str) -> None:
-    """A missing field is reported by pydantic with the whole body as its
-    ``input``, which would put the plaintext secret in the 422."""
-    payload = body(serverSecret="SUPER-SECRET-KEY")
+@pytest.mark.parametrize("field", ["serverId", "documentLink", "projectId"])
+def testAValidationErrorDoesNotEchoTheRequestBody(client: TestClient, field: str) -> None:
+    """Pydantic reports a missing field with the whole body as its ``input``,
+    which would reflect whatever was sent into every log and proxy that records
+    the response. app.main.validationErrorHandler allowlists what survives."""
+    payload = body(documentLink="https://example.com/DISTINCTIVE-VALUE.pdf")
     del payload[field]
 
     response = client.post("/api/v1/document", json=payload)
 
     assert response.status_code == 422
-    assert "SUPER-SECRET-KEY" not in response.text
+    assert "DISTINCTIVE-VALUE" not in response.text
 
 
 def testAValidationErrorStillSaysWhatWasWrong(client: TestClient) -> None:
     payload = body()
-    del payload["ragDbId"]
+    del payload["projectId"]
 
     response = client.post("/api/v1/document", json=payload)
 
     error = response.json()["detail"][0]
-    assert error["loc"] == ["body", "ragDbId"]
+    assert error["loc"] == ["body", "projectId"]
     assert error["type"] == "missing"
     assert error["msg"]
-
-
-def testARejectedSubmissionCreatesNoJob(client: TestClient) -> None:
-    manager = app.dependency_overrides[getJobManager]()  # Same instance every call.
-    before = len(manager)
-
-    client.post("/api/v1/document", json=body(serverSecret="wrong"))
-
-    assert len(manager) == before

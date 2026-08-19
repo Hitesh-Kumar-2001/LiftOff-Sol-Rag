@@ -17,14 +17,9 @@ import os
 import sys
 import time
 
-# Credentials for this run only. Set before app.security is imported, since
-# the registry reads its source at import time.
+# Who this run says it is. Nothing verifies it -- the API has no
+# authentication -- so it exists to label this script's requests in the log.
 SERVER_ID = "live-check"
-SERVER_SECRET = "live-check-secret"
-os.environ["RAG_SERVER_CREDENTIALS"] = (
-    '{"' + SERVER_ID + '": {"secret": "' + SERVER_SECRET + '"}}'
-)
-os.environ.pop("RAG_CREDENTIALS_FILE", None)
 
 if os.environ.get("RAG_TEST_MODE"):
     sys.exit("RAG_TEST_MODE is set; unset it or this checks the local store, not Pinecone.")
@@ -46,31 +41,31 @@ POLL_TIMEOUT_SECONDS = 900
 POLL_INTERVAL_SECONDS = 3
 
 
-def credentials() -> dict[str, str]:
-    return {"serverId": SERVER_ID, "serverSecret": SERVER_SECRET}
+def caller() -> dict[str, str]:
+    return {"serverId": SERVER_ID}
 
 
-def ragDbIdFor(url: str) -> str:
-    """A readable id per document, derived from its filename."""
+def projectIdFor(url: str) -> str:
+    """A readable project per document, derived from its filename."""
     name = url.rstrip("/").split("/")[-1].split("?")[0]
     return f"live-{name.rsplit('.', 1)[0][:40] or 'document'}"
 
 
-def submit(client: TestClient, url: str, ragDbId: str) -> None:
+def submit(client: TestClient, url: str, projectId: str) -> None:
     response = client.post(
         "/api/v1/document",
-        json={**credentials(), "documentLink": url, "ragDbId": ragDbId},
+        json={**caller(), "documentLink": url, "projectId": projectId},
     )
     response.raise_for_status()
     print(f"  submitted -> {response.json()}")
 
 
-def waitForCompletion(client: TestClient, ragDbId: str) -> dict:
+def waitForCompletion(client: TestClient, projectId: str) -> dict:
     deadline = time.time() + POLL_TIMEOUT_SECONDS
     lastStatus = None
     while time.time() < deadline:
         response = client.post(
-            "/api/v1/document/status", json={**credentials(), "ragDbId": ragDbId}
+            "/api/v1/document/status", json={**caller(), "projectId": projectId}
         )
         response.raise_for_status()
         payload = response.json()
@@ -80,16 +75,16 @@ def waitForCompletion(client: TestClient, ragDbId: str) -> dict:
         if payload["status"] in ("done", "failed"):
             return payload
         time.sleep(POLL_INTERVAL_SECONDS)
-    raise SystemExit(f"'{ragDbId}' never finished within {POLL_TIMEOUT_SECONDS}s")
+    raise SystemExit(f"'{projectId}' never finished within {POLL_TIMEOUT_SECONDS}s")
 
 
-def waitUntilSearchable(client: TestClient, ragDbId: str, attempts: int = 20) -> None:
+def waitUntilSearchable(client: TestClient, projectId: str, attempts: int = 20) -> None:
     """Pinecone indexes an upsert asynchronously, so a search fired the
     instant a job reports done can legitimately find nothing yet."""
     for attempt in range(attempts):
         response = client.post(
             "/api/v1/search",
-            json={**credentials(), "ragDbId": ragDbId, "query": "the", "topK": 1},
+            json={**caller(), "projectId": projectId, "query": "the", "topK": 1},
         )
         response.raise_for_status()
         if response.json()["hits"]:
@@ -100,10 +95,10 @@ def waitUntilSearchable(client: TestClient, ragDbId: str, attempts: int = 20) ->
     print("  WARNING: nothing searchable yet; querying anyway")
 
 
-def search(client: TestClient, ragDbId: str, query: str, topK: int = 3) -> None:
+def search(client: TestClient, projectId: str, query: str, topK: int = 3) -> None:
     response = client.post(
         "/api/v1/search",
-        json={**credentials(), "ragDbId": ragDbId, "query": query, "topK": topK},
+        json={**caller(), "projectId": projectId, "query": query, "topK": topK},
     )
     response.raise_for_status()
     hits = response.json()["hits"]
@@ -114,24 +109,24 @@ def search(client: TestClient, ragDbId: str, query: str, topK: int = 3) -> None:
 
 
 def main(urls: list[str]) -> None:
-    ragDbIds = [ragDbIdFor(url) for url in urls]
+    projectIds = [projectIdFor(url) for url in urls]
     store = None
 
     with TestClient(app) as client:
         try:
-            for url, ragDbId in zip(urls, ragDbIds):
-                print(f"\n=== {ragDbId} <- {url}")
+            for url, projectId in zip(urls, projectIds):
+                print(f"\n=== {projectId} <- {url}")
                 started = time.time()
-                submit(client, url, ragDbId)
-                result = waitForCompletion(client, ragDbId)
+                submit(client, url, projectId)
+                result = waitForCompletion(client, projectId)
                 print(f"  finished in {time.time() - started:.1f}s")
 
                 if result["status"] == "failed":
                     print("  FAILED -- skipping search for this one")
                     continue
-                waitUntilSearchable(client, ragDbId)
+                waitUntilSearchable(client, projectId)
                 for query in QUERIES:
-                    search(client, ragDbId, query)
+                    search(client, projectId, query)
         finally:
             # Runs even on failure, so a broken run does not leave vectors
             # behind in a live index.
@@ -141,10 +136,21 @@ def main(urls: list[str]) -> None:
             store = PineconeChunkStore()
             import asyncio
 
-            for ragDbId in ragDbIds:
+            from app.projectStore import getProjectStore
+
+            # Pinecone namespaces are keyed by ragDbId, not projectId, so the
+            # ids have to be resolved before anything can be deleted. This is
+            # the same process-wide store the API just used, so the mapping it
+            # minted is the one read back here.
+            projects = getProjectStore()
+            for projectId in projectIds:
+                ragDbId = asyncio.run(projects.resolve(projectId))
+                if ragDbId is None:
+                    print(f"  {projectId}: no database was ever created, nothing to delete")
+                    continue
                 asyncio.run(store.delete(ragDbId))
                 remaining = asyncio.run(store.get(ragDbId))
-                print(f"  deleted {ragDbId}: {len(remaining)} chunk(s) left")
+                print(f"  deleted {projectId} ({ragDbId}): {len(remaining)} chunk(s) left")
 
     if "--keep-index" not in sys.argv:
         print(f"  deleting index '{PINECONE_INDEX_NAME}'")

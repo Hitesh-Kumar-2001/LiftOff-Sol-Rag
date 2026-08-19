@@ -5,15 +5,12 @@ from contextlib import contextmanager
 import pytest
 from fastapi.testclient import TestClient
 
-from app.credentials import InMemoryCredentialSource, ServerCredential, hashSecret
 from app.documents import StubDocumentProcessor
 from app.jobManager import JobManager, getJobManager
 from app.jobs import Job, JobStatus
 from app.main import app
+from app.projectStore import InMemoryProjectStore, getProjectStore
 from app.ragIngestionPipeline import ChunkingStrategy
-from app.security import ServerRegistry, getServerRegistry
-
-SECRET = "s3cr3t-api-key"
 
 
 class SelectingProcessor:
@@ -37,19 +34,16 @@ class BlockingProcessor:
 
 @contextmanager
 def clientUsing(processor) -> Generator[TestClient]:
-    registry = ServerRegistry(
-        InMemoryCredentialSource(
-            [ServerCredential(serverId="billing-service", secretHash=hashSecret(SECRET))]
-        )
-    )
-    asyncio.run(registry.loadAll())
-
     # One manager for the whole test, not one per request -- a fresh instance
     # per call would make jobs vanish between the create and the lookup.
     jobManager = JobManager(processor)
+    # Likewise one mapping per test. The real store is a process-wide
+    # singleton, so a shared one would leave projects minted by earlier tests
+    # still resolving here.
+    projectStore = InMemoryProjectStore()
 
-    app.dependency_overrides[getServerRegistry] = lambda: registry
     app.dependency_overrides[getJobManager] = lambda: jobManager
+    app.dependency_overrides[getProjectStore] = lambda: projectStore
     try:
         with TestClient(app) as testClient:
             yield testClient
@@ -72,29 +66,27 @@ def rawClient() -> Iterator[TestClient]:
 def body(**overrides: str) -> dict[str, str]:
     payload = {
         "serverId": "billing-service",
-        "serverSecret": SECRET,
-        "ragDbId": "handbook",
+        "projectId": "handbook",
     }
     return payload | overrides
 
 
-def submit(client: TestClient, ragDbId: str = "handbook") -> None:
+def submit(client: TestClient, projectId: str = "handbook") -> None:
     client.post(
         "/api/v1/document",
         json={
             "serverId": "billing-service",
-            "serverSecret": SECRET,
             "documentLink": "https://example.com/handbook.pdf",
-            "ragDbId": ragDbId,
+            "projectId": projectId,
         },
     )
 
 
-def waitForDone(client: TestClient, ragDbId: str = "handbook", attempts: int = 50) -> dict:
+def waitForDone(client: TestClient, projectId: str = "handbook", attempts: int = 50) -> dict:
     """The stub processor finishes almost immediately, but on a background
     task -- poll rather than assume it has landed."""
     for _ in range(attempts):
-        payload = client.post("/api/v1/document/status", json=body(ragDbId=ragDbId)).json()
+        payload = client.post("/api/v1/document/status", json=body(projectId=projectId)).json()
         if payload["status"] == JobStatus.DONE.value:
             return payload
     raise AssertionError(f"job never reached {JobStatus.DONE.value}")
@@ -113,18 +105,31 @@ def testAQueuedJobReportsItsStatus(client: TestClient) -> None:
     }
 
 
-def testAFinishedJobReportsStatusAndRagDbIdOnly(client: TestClient) -> None:
+def testAFinishedJobReportsStatusAndProjectIdOnly(client: TestClient) -> None:
     """The whole contract: two fields, nothing else."""
     submit(client)
 
     payload = waitForDone(client)
 
-    assert payload == {"status": "done", "ragDbId": "handbook"}
+    assert payload == {"status": "done", "projectId": "handbook"}
 
 
-def testARawDocumentAnswersWithItsLinkInsteadOfARagDbId(rawClient: TestClient) -> None:
+def testTheInternalRagDbIdIsNeverReturned(client: TestClient) -> None:
+    """A caller polls with a projectId and is answered with one. Where the
+    chunks actually live stays ours to change."""
+    submit(client)
+    ragDbId = asyncio.run(app.dependency_overrides[getProjectStore]().resolve("handbook"))
+
+    response = client.post("/api/v1/document/status", json=body())
+
+    assert ragDbId is not None, "the submission should have minted a database"
+    assert ragDbId not in response.text
+    assert "ragDbId" not in response.text
+
+
+def testARawDocumentAnswersWithItsLinkInsteadOfAProjectId(rawClient: TestClient) -> None:
     """A document kept whole was never written to a vector database, so there
-    is nothing to query by ragDbId."""
+    is nothing to query at all."""
     submit(rawClient)
 
     payload = waitForDone(rawClient)
@@ -135,13 +140,13 @@ def testARawDocumentAnswersWithItsLinkInsteadOfARagDbId(rawClient: TestClient) -
 @pytest.mark.parametrize(
     "strategy", [ChunkingStrategy.NON_AI, ChunkingStrategy.AI], ids=["nonAi", "ai"]
 )
-def testAChunkedDocumentAnswersWithItsRagDbId(strategy: ChunkingStrategy) -> None:
+def testAChunkedDocumentAnswersWithItsProjectId(strategy: ChunkingStrategy) -> None:
     with clientUsing(SelectingProcessor(strategy)) as client:
         submit(client)
 
         payload = waitForDone(client)
 
-        assert payload == {"status": "done", "ragDbId": "handbook"}
+        assert payload == {"status": "done", "projectId": "handbook"}
 
 
 def testTheTwoAnswersAreNeverSentTogether(rawClient: TestClient) -> None:
@@ -151,10 +156,10 @@ def testTheTwoAnswersAreNeverSentTogether(rawClient: TestClient) -> None:
 
     payload = waitForDone(rawClient)
 
-    assert ("ragDbId" in payload) != ("documentLink" in payload)
+    assert ("projectId" in payload) != ("documentLink" in payload)
 
 
-def testAJobStillQueuedAnswersWithItsRagDbId() -> None:
+def testAJobStillQueuedAnswersWithItsProjectId() -> None:
     """The strategy is not known until the document has been analyzed, so a
     job that has not got there yet is answered the ordinary way."""
     with clientUsing(BlockingProcessor()) as client:
@@ -162,55 +167,25 @@ def testAJobStillQueuedAnswersWithItsRagDbId() -> None:
 
         payload = client.post("/api/v1/document/status", json=body()).json()
 
-        assert payload["ragDbId"] == "handbook"
+        assert payload["projectId"] == "handbook"
         assert "documentLink" not in payload
 
 
-def testTheStatusIsReportedForTheRagDbIdAsked(client: TestClient) -> None:
-    submit(client, ragDbId="policies")
+def testTheStatusIsReportedForTheProjectIdAsked(client: TestClient) -> None:
+    submit(client, projectId="policies")
 
-    payload = client.post("/api/v1/document/status", json=body(ragDbId="policies")).json()
+    payload = client.post("/api/v1/document/status", json=body(projectId="policies")).json()
 
-    assert payload["ragDbId"] == "policies"
+    assert payload["projectId"] == "policies"
 
 
-def testAnUnknownRagDbIdIsNotFound(client: TestClient) -> None:
-    response = client.post("/api/v1/document/status", json=body(ragDbId="never-submitted"))
+def testAnUnknownProjectIdIsNotFound(client: TestClient) -> None:
+    response = client.post("/api/v1/document/status", json=body(projectId="never-submitted"))
 
     assert response.status_code == 404
 
 
-def testWrongSecretIsRejected(client: TestClient) -> None:
-    submit(client)
-
-    response = client.post("/api/v1/document/status", json=body(serverSecret="wrong"))
-
-    assert response.status_code == 401
-
-
-def testUnknownServerIsRejected(client: TestClient) -> None:
-    submit(client)
-
-    response = client.post("/api/v1/document/status", json=body(serverId="nobody"))
-
-    assert response.status_code == 401
-
-
-def testAnUnknownRagDbIdIsIndistinguishableWithoutCredentials(client: TestClient) -> None:
-    """Authentication runs first, so a bad caller cannot probe which ragDbIds
-    exist by comparing 401s against 404s."""
-    submit(client)
-
-    known = client.post("/api/v1/document/status", json=body(serverSecret="wrong"))
-    unknown = client.post(
-        "/api/v1/document/status", json=body(ragDbId="never-submitted", serverSecret="wrong")
-    )
-
-    assert known.status_code == unknown.status_code == 401
-    assert known.json() == unknown.json()
-
-
-@pytest.mark.parametrize("field", ["serverId", "serverSecret", "ragDbId"])
+@pytest.mark.parametrize("field", ["serverId", "projectId"])
 def testEveryFieldIsRequired(client: TestClient, field: str) -> None:
     payload = body()
     del payload[field]
@@ -220,7 +195,7 @@ def testEveryFieldIsRequired(client: TestClient, field: str) -> None:
     assert response.status_code == 422
 
 
-@pytest.mark.parametrize("field", ["serverId", "serverSecret", "ragDbId"])
+@pytest.mark.parametrize("field", ["serverId", "projectId"])
 def testBlankFieldsAreRejected(client: TestClient, field: str) -> None:
     response = client.post("/api/v1/document/status", json=body(**{field: ""}))
 
@@ -231,21 +206,3 @@ def testUnexpectedFieldsAreRejected(client: TestClient) -> None:
     response = client.post("/api/v1/document/status", json=body(role="admin"))
 
     assert response.status_code == 422
-
-
-def testTheSecretIsNeverEchoedBack(client: TestClient) -> None:
-    submit(client)
-
-    response = client.post("/api/v1/document/status", json=body(serverSecret="wrong"))
-
-    assert "wrong" not in response.text
-
-
-def testAValidationErrorNeverEchoesTheSecret(client: TestClient) -> None:
-    payload = body(serverSecret="SUPER-SECRET-KEY")
-    del payload["ragDbId"]
-
-    response = client.post("/api/v1/document/status", json=payload)
-
-    assert response.status_code == 422
-    assert "SUPER-SECRET-KEY" not in response.text

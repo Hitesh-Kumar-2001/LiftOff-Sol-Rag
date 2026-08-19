@@ -8,7 +8,6 @@ from fastapi.responses import JSONResponse
 
 from app.jobManager import getJobManager
 from app.routes import router
-from app.security import getServerRegistry, refreshing
 
 logger = logging.getLogger(__name__)
 
@@ -19,18 +18,9 @@ SAFE_ERROR_KEYS = ("type", "loc", "msg")
 
 @asynccontextmanager
 async def lifespan(app: FastAPI) -> AsyncIterator[None]:
-    # Resolved the same way the route resolves it, so startup can never fill one
-    # registry while requests read another.
-    registry = getServerRegistry()
-
-    # Fill memory before the first request lands. Failing here is deliberate: a
-    # process that cannot read the credential store should not accept traffic.
-    logger.info("Loaded %d server credentials.", await registry.loadAll())
-
     jobs = getJobManager()
     try:
-        async with refreshing(registry):
-            yield
+        yield
     finally:
         # Let in-flight ingestion jobs finish rather than be killed mid-write
         # when the process exits. This waits; it does not cancel.
@@ -45,14 +35,14 @@ app.include_router(router)
 async def validationErrorHandler(request: Request, exc: RequestValidationError) -> JSONResponse:
     """Answer a malformed request without quoting it back.
 
-    Pydantic reports a missing field by including the whole request body as
-    the error's ``input``, which on these endpoints means the plaintext
-    ``serverSecret`` lands in the 422 body -- and in any log, proxy, or
-    browser console that records the response. ``SecretStr`` does not help
-    here: the value never becomes one, because validation is what failed.
+    Pydantic reports a missing field by including the whole request body as the
+    error's ``input``, so a 422 would otherwise echo whatever was sent into any
+    log, proxy, or browser console that records the response. There is no
+    secret in these bodies any more, but a request body is still the caller's
+    data and not something to reflect back by default.
 
     An allowlist rather than dropping ``input`` by name, so a future pydantic
-    field carrying request values cannot quietly reintroduce the leak. What
+    field carrying request values cannot quietly reintroduce the echo. What
     survives is enough to fix a request: what was wrong, and where.
     """
     detail = [

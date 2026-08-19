@@ -19,3 +19,6 @@ keys/
 *credentials*.json
 .env.local
 
+
+# Claude Code runtime artefacts. The skills directory is source and is tracked.
+.claude/scheduled_tasks.lock

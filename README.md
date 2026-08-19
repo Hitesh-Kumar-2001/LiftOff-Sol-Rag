@@ -1,11 +1,17 @@
 # RAG API
 
-A FastAPI service that answers questions from a chosen RAG database, callable
-only by servers it can verify. Managed with `uv`.
+A FastAPI service that ingests documents into per-project RAG databases and
+searches them. Managed with `uv`.
 
-**Status:** the API surface and server authentication are built and tested.
-Retrieval is not — the handler validates everything, then returns a placeholder
-answer. See [What isn't built yet](#what-isnt-built-yet).
+> **There is no authentication.** Every endpoint takes a `serverId`, but nothing
+> verifies it — there is no secret, no signature, and no registry behind it. It is
+> a label for the log. Anyone who can reach this API can ingest into any project
+> and read any project's chunks, under any name they choose. Do not expose it
+> publicly without putting authentication in front of it first.
+
+**Status:** ingestion, chunking, embedding, and retrieval are built and tested.
+`POST /api/v1/query` still returns a placeholder rather than a generated answer.
+See [What isn't built yet](#what-isnt-built-yet).
 
 ## Run locally
 
@@ -17,33 +23,53 @@ Open <http://127.0.0.1:8000/docs> for the interactive API documentation.
 
 ## Asking a question
 
-`POST /api/v1/query` takes the calling server's credentials and the question in
-one JSON body:
+`POST /api/v1/query` takes the calling server's id and the question in one JSON
+body:
 
 ```json
 {
   "serverId": "billing-service",
-  "serverSecret": "top-secret",
   "question": "What is the refund window?",
-  "ragDbId": "handbook"
+  "projectId": "handbook"
 }
 ```
 
 ```json
 {
   "answer": "...",
-  "ragDbId": "handbook"
+  "projectId": "handbook"
 }
 ```
 
 | Status | Meaning |
 | ------ | ------- |
-| 200 | Verified caller; answer returned |
-| 401 | `serverId` unknown, or `serverSecret` wrong (the two are not distinguished) |
+| 200 | Answer returned |
 | 422 | A field is missing, blank, or unexpected |
 
-`serverId` + `serverSecret` say *who is asking*; `question` + `ragDbId` say
-*what to answer and from where*.
+`serverId` says *who is asking*, for the log and nothing else; `question` +
+`projectId` say *what to answer and from where*.
+
+## Projects and databases
+
+A caller names a **project** and never a database. Internally every project
+resolves to a `ragDbId` — the job's id, the Pinecone namespace, and what the
+conflict check claims — and that id never appears on the wire.
+
+They are one-to-one today, and deliberately not the same string. A project is a
+caller's permanent name for "my documents"; a `ragDbId` is where those documents
+happen to live right now, and that should stay ours to change: rebuilding a
+project into a fresh namespace, versioning it, or one day splitting it across
+several databases are all changes to the mapping alone, invisible to whoever is
+calling. The id is random rather than derived precisely so that nothing can
+recompute one from the other and quietly depend on the two staying in step.
+
+The mapping lives in [app/projectStore.py](app/projectStore.py) — in Firestore
+when `GCP_PROJECT_ID` is set, in memory otherwise, the same durability switch the
+job table uses. It is **write-once**: resolving a project must return the same
+`ragDbId` every time, because handing back a different one leaves everything
+already ingested under the old id sitting in Pinecone, billable and unreachable.
+Only `POST /api/v1/document` may create one; everything else resolves read-only,
+so a mistyped `projectId` on a search cannot leave an empty database behind.
 
 ## Submitting a document
 
@@ -53,40 +79,43 @@ one JSON body:
 ```json
 {
   "serverId": "billing-service",
-  "serverSecret": "top-secret",
   "documentLink": "https://example.com/handbook.pdf",
-  "ragDbId": "handbook"
+  "projectId": "handbook"
 }
 ```
 
 ```json
 {
-  "jobId": "handbook",
+  "projectId": "handbook",
   "status": "queued"
 }
 ```
 
 | Status | Meaning |
 | ------ | ------- |
-| 202 | Verified caller; job created and running in the background |
-| 401 | `serverId` unknown, or `serverSecret` wrong |
+| 202 | Job created and running in the background |
+| 409 | A different document is already being ingested into this project |
 | 422 | A field is missing, blank, or unexpected |
+| 503 | The queue was unreachable; nothing was started, so resubmit as-is |
 
-`jobId` is the `ragDbId` itself, not a generated id — a job exists to populate
-one RAG database, so there's nothing else meaningful to key it by. A second
-submission for a `ragDbId` that already has a job reuses that same job id and
-replaces the previous record; the earlier task is *not* cancelled, it just runs
-to completion writing into a `Job` nothing can look up anymore. Deduplicating,
-queueing, or cancelling on resubmission is a policy decision for later.
+No job id comes back, deliberately. A job is keyed by the `ragDbId` behind the
+project — a job exists to populate one RAG database, so there is nothing else
+meaningful to key it by — and that id is internal. The `projectId` the caller
+already sent is what `/document/status` takes, so it is the only id worth
+returning. A project's first submission is what brings its database into
+existence; every later one resolves to the same database and lands on the same
+job. Deduplicating, queueing, or cancelling on resubmission is a policy decision
+for later.
 
 What "processing" a document means beyond metadata extraction — chunking,
 embedding, writing into the `ragDbId` — is not fully decided yet. See
 [app/documents.py](app/documents.py): `DocumentProcessor` is the contract real
 ingestion plugs into; `StubDocumentProcessor` just marks the job done without
-doing anything. There is no endpoint yet to poll a job's status — a natural
-next addition.
+doing anything. `POST /api/v1/document/status` polls a job's progress.
 
-Jobs live in memory only and do not survive a restart. On shutdown, the app
+Where jobs live depends on configuration (see [Where jobs run](#where-jobs-run));
+with neither `GCP_PROJECT_ID` nor a broker set they are held in memory and do not
+survive a restart. On shutdown, the app
 *waits* for any job still running rather than cancelling it — a job mid-download
 or mid-analysis has no safe halfway point to stop at. This can't hang forever:
 a download is capped at `DOWNLOAD_TIMEOUT_SECONDS`, so every job finishes (or
@@ -96,7 +125,7 @@ endpoint, not part of submission.
 
 A `.zip` or `.rar` is searched recursively — an archive containing another
 archive is unpacked in turn, however many levels deep (capped at
-`MAX_ARCHIVE_DEPTH`, currently 5, to bound a maliciously nested archive). A
+`MAX_ARCHIVE_DEPTH`, currently 1, to bound a maliciously nested archive). A
 nested file's `filename` carries its full path, e.g.
 `outer.zip/inner.rar/doc.pdf`, so the origin stays visible even though the
 result is a flat list. `DocumentMetadata` also totals `pageCount`,
@@ -119,8 +148,9 @@ survives restarts if this matters for your deployment.
 
 | File | Responsibility |
 | ---- | -------------- |
-| [app/main.py](app/main.py) | Builds the app; loads credentials at startup, keeps them fresh, and cancels in-flight jobs on shutdown |
-| [app/routes.py](app/routes.py) | The endpoints: verify the caller, then answer or queue |
+| [app/main.py](app/main.py) | Builds the app, and waits for in-flight jobs on shutdown |
+| [app/routes.py](app/routes.py) | The endpoints: resolve the project, then answer or queue |
+| [app/projectStore.py](app/projectStore.py) | `projectId` → `ragDbId`, and nothing else. The indirection stops at the route |
 | [app/jobManager.py](app/jobManager.py) | What the API talks to for jobs — create, look up by id, shut down cleanly. Picks which manager from the environment |
 | [app/jobs.py](app/jobs.py) | A job's data (`Job`, `JobStatus`), `runJob` which executes one, and `resolveSubmission` — the reuse/conflict rules every manager shares |
 | [app/firestoreJobStore.py](app/firestoreJobStore.py) | The job table in Firestore. Storage only; the claim is a transaction |
@@ -129,47 +159,17 @@ survives restarts if this matters for your deployment.
 | [app/celeryApp.py](app/celeryApp.py) / [app/celeryTasks.py](app/celeryTasks.py) | The broker configuration, and what a worker does with a queued job |
 | [app/documents.py](app/documents.py) | The `DocumentProcessor` contract, plus the real (and stub) implementations |
 | [app/schemas.py](app/schemas.py) | The wire contract — camelCase JSON in and out, snake_case in Python |
-| [app/security.py](app/security.py) | Holds credentials in RAM and checks them |
-| [app/credentials.py](app/credentials.py) | Where credentials come from, and whether that source can change |
-
-The split that matters is the last two: `security.py` decides *whether a caller
-is who it says*, `credentials.py` decides *where the answer to that comes from*.
-Changing storage touches one file.
 
 ### A request, start to finish
 
 1. **Validation.** FastAPI checks the body against `QueryRequest` before any of
    our code runs. A missing, blank, over-long, or unexpected field is a 422 —
    the handler never sees a malformed request.
-2. **Verification.** The route hands `serverId` and `serverSecret` to the
-   registry, which is a dict lookup plus one constant-time digest compare
-   against the in-memory copy. No I/O, so a flood of bad credentials costs a
-   hash each and never reaches the store. A failure raises a 401 whose message
-   deliberately does not reveal which half was wrong.
-3. **Retrieval.** Not built. `ragDbId` and `question` are where it will plug in.
+2. **Logging.** `serverId` is written to the log line for the request. Nothing
+   checks it; see the warning at the top of this file.
+3. **Retrieval.** Not built. The `ragDbId` the `projectId` resolves to, and
+   `question`, are where it will plug in.
 4. **Response.** `QueryResponse` is serialized back to camelCase.
-
-The secret is typed `SecretStr`, so it does not appear in logs, tracebacks, or
-error responses even if something goes wrong mid-request.
-
-### Startup and shutdown
-
-```
-startup ──► read every credential ──► hold in memory ──┐
-                                                       │
-(shared stores only)                                   │
-every 30s ─► read every credential ──► replace ────────┤
-                                                       ▼
-request ─────────────────────────────────────────► check memory
-                                                       │
-                                              hit ─────► proceed
-                                             miss ─────► 401
-```
-
-The lifespan hook fills memory before the first request lands. If the store is
-unreachable or malformed, **startup fails** — a process that cannot verify
-callers should not accept traffic, and a config typo should surface on deploy
-rather than on the first request.
 
 ### Where jobs run
 
@@ -188,12 +188,12 @@ A broker without a project **fails at startup** rather than falling back. The
 worker is a different process, so a dict the API owns is a table the worker
 cannot see: the API would write jobs the worker never reads, the worker's status
 writes would land nowhere, and `/document/status` would 404 every running job —
-while the deployment looked healthy. Same reasoning as the credential store: a
+while the deployment looked healthy. The principle holds generally here: a
 config mistake should surface on deploy, not in production.
 
 ```
-POST /document ─► authenticate ─► claim ragDbId ─► enqueue id ─► 202
-                                    (atomic)          │
+POST /document ─► resolve project ─► claim ragDbId ─► enqueue id ─► 202
+                                        (atomic)      │
                                                       ▼
                                               worker ─► read job ─► ingest ─► write status
                                                                                   │
@@ -276,54 +276,14 @@ Two things are known and accepted rather than fixed:
   reclaim assumes they are, so leave `RAG_STALE_JOB_SECONDS` unset when running
   workers there.
 
-### Keeping the copy honest
-
-Whether the in-memory copy is re-read on a timer is the *store's* decision,
-declared as `refreshInterval`:
-
-| Store | `refreshInterval` | Why |
-| ----- | ------------------ | --- |
-| File, env var | `None` | Nothing else can change them while the node runs, so polling would re-read the same bytes forever. Edit and restart. |
-| Firestore, any shared DB | 30s | Another process can add, rotate, or revoke a credential at any moment. |
-
-For a shared store the timer is the only thing that keeps memory honest, and
-that interval is the window in which a revoked server is still served. Checking
-the store only when auth *fails* would never catch a revocation at all: a
-revoked server still sends a secret that matches the stale copy in memory, so
-the check passes and the store is never consulted.
-
-If a refresh fails, the last known-good copy keeps serving traffic and the next
-tick retries — a store outage must not lock out every caller.
-
-### Adding a store
-
-`CredentialSource` in [app/credentials.py](app/credentials.py) is one method and
-one attribute. A Firestore adapter is the whole of it:
-
-```python
-class FirestoreCredentialSource:
-    refreshInterval = DEFAULT_REFRESH_INTERVAL_SECONDS  # shared: must be polled
-
-    async def loadAll(self):
-        return [
-            _toCredential(doc.id, doc.to_dict())
-            async for doc in self._collection.stream()
-        ]
-```
-
-Return it from `buildCredentialSource()` and it starts being polled because it
-declares an interval. Nothing in `security.py`, `routes.py`, or `main.py`
-changes.
-
 ## Configuration
 
 | Variable | Effect |
 | -------- | ------ |
-| `RAG_CREDENTIALS_FILE` | Path to a JSON credentials file. Takes precedence. |
-| `RAG_SERVER_CREDENTIALS` | The same JSON, inline. Used when no file is named. |
 | `GCP_PROJECT_ID` | Set to keep the job table in Firestore instead of process memory. |
 | `GOOGLE_APPLICATION_CREDENTIALS` | Path to a service account key. Omit inside GCP, where the platform supplies credentials. |
 | `FIRESTORE_JOBS_COLLECTION` | Collection holding the job table. Default `ragJobs`. |
+| `FIRESTORE_PROJECTS_COLLECTION` | Collection holding the `projectId` → `ragDbId` mapping. Default `ragProjects`. |
 | `FIRESTORE_DATABASE_ID` | Which database in the project. Leave unset for the special `(default)` one. |
 | `CELERY_BROKER_URL` | Set to dispatch ingestion to workers, e.g. `redis://localhost:6379/0`. Requires `GCP_PROJECT_ID`. |
 | `CELERY_TIME_LIMIT` | Hard kill for one ingestion, in seconds. Default 1800. |
@@ -331,34 +291,22 @@ changes.
 | `CELERY_VISIBILITY_TIMEOUT` | How long the broker waits before redelivering. Must exceed `CELERY_TIME_LIMIT`. Default is twice it. |
 | `RAG_STALE_JOB_SECONDS` | Age past which a stuck job's `ragDbId` may be reclaimed. Defaults to twice `CELERY_TIME_LIMIT`; only applies under Celery. Must exceed the longest a job could legitimately run. |
 
-Both hold the servers allowed to call the API:
-
-```json
-{
-  "billing-service": {"secret": "top-secret"},
-  "admin-service":   {"secretSha256": "9f86d0818884..."}
-}
-```
-
-- Use `secretSha256` in production; `secret` is accepted so a freshly generated
-  key can be pasted in as-is. Generate a pair with:
-  `python -c "import secrets,hashlib;s=secrets.token_urlsafe(32);print(s, hashlib.sha256(s.encode()).hexdigest())"`
-- Secrets must be high-entropy random strings, not chosen passwords — SHA-256 is
-  not a password KDF.
-- With neither variable set, the store is empty and every request gets a 401.
-- Malformed credentials fail startup rather than surfacing on the first request.
+There is no credential configuration: the API does not authenticate anyone.
+`GOOGLE_APPLICATION_CREDENTIALS`, `PINECONE_API_KEY`, and `GEMINI_API_KEY` are
+this service's own credentials for the infrastructure it calls, not its callers'.
 
 ## What isn't built yet
 
-- **Retrieval.** No vector store, embeddings, or chunking. `ragDbId` is accepted
-  and echoed back but nothing resolves it to an actual database yet.
-- **Per-server access control.** Any verified server may name any `ragDbId`.
-  Worth adding before two tenants share the deployment.
-- **A Firestore adapter** for credentials. The seam is ready; the adapter is not
-  written.
-- **Ingestion past metadata.** `POST /document` downloads and analyzes the
-  document (see [app/documents.py](app/documents.py)) but nothing chunks,
-  embeds, or writes it into the `ragDbId` yet.
+- **Generated answers.** `POST /api/v1/search` returns the matching chunks, but
+  `POST /api/v1/query` still returns a placeholder — nothing yet writes an answer
+  from what was retrieved. Ingestion, chunking, embedding, and retrieval
+  themselves are built (see [app/ragIngestionPipeline.py](app/ragIngestionPipeline.py)
+  and [app/pineconeChunkStore.py](app/pineconeChunkStore.py)).
+- **Authentication, and any access control at all.** `serverId` is unverified,
+  so every caller is anonymous in practice and every project is readable and
+  writable by anyone who can reach the service. The project mapping is not scoped
+  by `serverId` either, so two callers picking the same project name share one
+  database. This has to come back before the API is exposed to anything.
 - **Job eviction.** Finished jobs are never removed from the table. In memory
   they leak; in Firestore they accumulate. Planned as its own endpoint, separate
   from submission.
