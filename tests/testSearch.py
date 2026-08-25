@@ -4,11 +4,11 @@ from collections.abc import Iterator
 import pytest
 from fastapi.testclient import TestClient
 
-from app.chunkStoreFactory import getChunkStore
-from app.localChunkStore import ENV_TEST_MODE, LocalChunkStore
+from app.ingestion.ragIngestionPipeline import Chunk, lexicalSearch
 from app.main import app
-from app.projectStore import InMemoryProjectStore, getProjectStore
-from app.ragIngestionPipeline import Chunk, lexicalSearch
+from app.stores.chunkStoreFactory import getChunkStore
+from app.stores.localChunkStore import ENV_TEST_MODE, LocalChunkStore
+from app.stores.projectStore import InMemoryProjectStore, getProjectStore
 
 CHUNKS = [
     Chunk(text="Refunds are issued within 30 days of purchase.", index=0, tokenCount=9),

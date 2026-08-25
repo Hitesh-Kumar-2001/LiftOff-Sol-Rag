@@ -13,18 +13,32 @@ dependencies = [
     "google-genai>=1.5.0",
     "pinecone>=5.0.0",
     "python-dotenv>=1.0.0",
+    # The projectId -> ragDbId mapping and the system prompts
+    # (app.stores.projectStore, app.agent.promptStore).
     "firebase-admin>=6.4.0",
-    "celery>=5.4",
+    # The job table, the worker queue, and the prompt cache
+    # (app.jobs.redisJobStore, app.jobs.jobQueue, app.agent.promptStore).
     "redis>=5.0",
+    # CPU/memory/disk for the /health endpoint (app.infra.machineStats).
+    "psutil>=5.9",
+    # The answering agent (app.agent). deepagents brings langgraph and
+    # langchain-core with it; the four provider packages are what the LLM
+    # manager imports lazily, one per provider it can be asked for.
+    "deepagents>=0.7.8",
+    "langchain-anthropic>=1.6",
+    "langchain-openai>=1.6",
+    "langchain-groq>=1.1",
+    "langchain-google-genai>=4.3",
+    # Web search for the agent. Only used when TAVILY_API_KEY is set.
+    "langchain-tavily>=0.2.18",
 ]
 
 [dependency-groups]
 dev = [
     "pytest>=9.1.1",
-    # Only for scripts/liveCeleryCheck.py, which runs its broker on kombu's
-    # filesystem transport; that transport locks its spool files through
-    # pywin32. No production broker needs it.
-    'pywin32>=306; sys_platform == "win32"',
+    # An in-process Redis for the job-table and queue tests, so the suite needs
+    # no server running. The live checks under scripts/ use a real one.
+    "fakeredis>=2.21",
 ]
 
 [tool.pytest.ini_options]

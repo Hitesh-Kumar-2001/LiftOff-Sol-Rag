@@ -2,13 +2,13 @@
 
 These used to be restated inside each manager. They are now one function, so
 this is the only place the rules are pinned down -- and a manager that stops
-calling it fails the tests in testCeleryJobs.py instead of silently answering
+calling it fails the tests in testRedisJobs.py instead of silently answering
 differently from the others.
 """
 
 import pytest
 
-from app.jobs import Job, JobStatus, Submission, resolveSubmission
+from app.jobs.job import Job, JobStatus, Submission, resolveSubmission
 
 LINK = "https://example.com/doc.pdf"
 OTHER_LINK = "https://example.com/other.pdf"

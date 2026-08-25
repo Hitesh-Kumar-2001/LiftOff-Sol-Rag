@@ -11,7 +11,7 @@ from collections.abc import Iterator
 
 import pytest
 
-from app.projectStore import (
+from app.stores.projectStore import (
     InMemoryProjectStore,
     buildProjectStore,
     newRagDbId,
@@ -108,7 +108,7 @@ def testALongProjectIdDoesNotProduceAnUnboundedId() -> None:
 
 
 def testWithoutAGcpProjectTheMappingIsInMemory(noGcpProject) -> None:
-    """Same switch as the job table in app.jobManager -- the two are one
+    """Same switch as the job table in app.jobs.jobManager -- the two are one
     durability decision and must not be able to disagree."""
     assert isinstance(buildProjectStore(), InMemoryProjectStore)
     assert not os.environ.get("GCP_PROJECT_ID")

@@ -2,9 +2,9 @@ import asyncio
 
 import pytest
 
-from app.documents import StubDocumentProcessor
-from app.jobManager import JobConflictError, JobManager
-from app.jobs import Job, JobStatus
+from app.ingestion.documents import StubDocumentProcessor
+from app.jobs.job import Job, JobStatus
+from app.jobs.jobManager import JobConflictError, JobManager
 
 
 class BlockingProcessor:

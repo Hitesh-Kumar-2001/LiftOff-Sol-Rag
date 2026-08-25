@@ -27,7 +27,7 @@ if os.environ.get("RAG_TEST_MODE"):
 from fastapi.testclient import TestClient  # noqa: E402
 
 from app.main import app  # noqa: E402
-from app.pineconeChunkStore import PINECONE_INDEX_NAME, pineconeClient  # noqa: E402
+from app.stores.pineconeChunkStore import PINECONE_INDEX_NAME, pineconeClient  # noqa: E402
 
 # Asked of each database once it is ingested, to show retrieval returning
 # something related rather than merely returning something.
@@ -131,12 +131,12 @@ def main(urls: list[str]) -> None:
             # Runs even on failure, so a broken run does not leave vectors
             # behind in a live index.
             print("\n=== cleanup")
-            from app.pineconeChunkStore import PineconeChunkStore
+            from app.stores.pineconeChunkStore import PineconeChunkStore
 
             store = PineconeChunkStore()
             import asyncio
 
-            from app.projectStore import getProjectStore
+            from app.stores.projectStore import getProjectStore
 
             # Pinecone namespaces are keyed by ragDbId, not projectId, so the
             # ids have to be resolved before anything can be deleted. This is

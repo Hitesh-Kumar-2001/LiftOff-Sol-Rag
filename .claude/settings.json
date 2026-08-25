@@ -1,0 +1,10 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(cd '//wsl.localhost/Ubuntu/home/hites/projects/rag' && sed -n '58,79p; 153,171p; 234,245p; 289,296p' app/api/routes.py)",
+      "Read(///wsl.localhost/Ubuntu/home/hites/projects/**)",
+      "Bash(cd '//wsl.localhost/Ubuntu/home/hites/projects/rag' && grep -n \"^@app\\\\|^async def\\\\|^def\" app/main.py | grep -B1 \"def \")",
+      "Bash(uv run *)"
+    ]
+  }
+}

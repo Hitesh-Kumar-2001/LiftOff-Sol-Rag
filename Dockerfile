@@ -20,7 +20,6 @@ RUN uv sync --frozen --no-dev
 
 # Copy application
 COPY app ./app
-COPY api ./api
 COPY scripts ./scripts
 
 # FastAPI

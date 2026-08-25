@@ -20,12 +20,12 @@ import time
 if os.environ.get("RAG_TEST_MODE"):
     sys.exit("RAG_TEST_MODE is set; unset it or this checks the local store.")
 
-from app.pineconeChunkStore import (  # noqa: E402
+from app.ingestion.ragIngestionPipeline import Chunk  # noqa: E402
+from app.stores.pineconeChunkStore import (  # noqa: E402
     PINECONE_INDEX_NAME,
     PineconeChunkStore,
     pineconeClient,
 )
-from app.ragIngestionPipeline import Chunk  # noqa: E402
 
 RAG_DB = "live-store-check"
 OTHER_DB = "live-store-neighbour"

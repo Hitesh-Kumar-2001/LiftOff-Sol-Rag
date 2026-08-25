@@ -13,8 +13,8 @@ import pytest
 from pinecone.models.vectors import FetchResponse, ListItem, ListResponse, Vector
 from pinecone.models.vectors.search import Hit
 
-from app.pineconeChunkStore import UPSERT_BATCH_SIZE, PineconeChunkStore, namespaceFor
-from app.ragIngestionPipeline import Chunk
+from app.ingestion.ragIngestionPipeline import Chunk
+from app.stores.pineconeChunkStore import UPSERT_BATCH_SIZE, PineconeChunkStore, namespaceFor
 
 
 class SimulatedIndex:

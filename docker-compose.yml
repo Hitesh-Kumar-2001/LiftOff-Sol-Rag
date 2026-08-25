@@ -1,0 +1,68 @@
+# Local/single-node deployment. Three services, and which of them does the work
+# depends on one variable:
+#
+#   REDIS_URL unset  -- the API ingests on its own event loop. `worker` exits
+#                       immediately, saying it has no queue to read. Fine for a
+#                       look around; jobs die with the container.
+#   REDIS_URL set    -- the API only claims the ragDbId and pushes it onto the
+#                       queue, and `worker` is the process that ingests. It also
+#                       needs GCP_PROJECT_ID, or the API refuses to start (see
+#                       app/jobs/jobManager.py for why the pair is required).
+#
+# Inside this network Redis is `redis`, never localhost:
+#   REDIS_URL=redis://redis:6379/0
+services:
+  api:
+    build: .
+    container_name: rag-api
+    env_file:
+      - .env
+    # keys/ is in .dockerignore -- a service account key must not be baked into
+    # an image -- so GOOGLE_APPLICATION_CREDENTIALS only resolves if the
+    # directory is mounted in at run time. Read-only: nothing writes here.
+    volumes:
+      - ./keys:/app/keys:ro
+    ports:
+      - "8000:8000"
+    depends_on:
+      redis:
+        condition: service_healthy
+
+  # The process that actually ingests documents. Without it a deployment with
+  # REDIS_URL set answers every submission with 202 and never processes one:
+  # the API claims the id and enqueues it, and nothing is on the other end.
+  #
+  # Deliberately no restart policy. With REDIS_URL unset this exits at once and
+  # stays exited, which is the visible answer; restarting it in a loop would
+  # bury the reason in the log.
+  worker:
+    build: .
+    container_name: rag-worker
+    command: ["uv", "run", "python", "-m", "app.jobs.worker"]
+    env_file:
+      - .env
+    volumes:
+      - ./keys:/app/keys:ro
+    depends_on:
+      redis:
+        condition: service_healthy
+
+  redis:
+    image: redis:7-alpine
+    container_name: rag-redis
+    ports:
+      - "6379:6379"
+    # Jobs are working state and their loss is survivable, but losing the table
+    # mid-ingestion strands every claimed ragDbId at a 409 until its TTL runs
+    # out -- days, by default. Cheap enough to persist.
+    command: ["redis-server", "--appendonly", "yes"]
+    volumes:
+      - redisData:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
+volumes:
+  redisData:

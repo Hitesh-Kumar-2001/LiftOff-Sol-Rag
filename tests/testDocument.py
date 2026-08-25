@@ -5,11 +5,11 @@ from contextlib import contextmanager
 import pytest
 from fastapi.testclient import TestClient
 
-from app.documents import StubDocumentProcessor
-from app.jobManager import JobManager, getJobManager
-from app.jobs import Job
+from app.ingestion.documents import StubDocumentProcessor
+from app.jobs.job import Job
+from app.jobs.jobManager import JobManager, getJobManager
 from app.main import app
-from app.projectStore import InMemoryProjectStore, getProjectStore
+from app.stores.projectStore import InMemoryProjectStore, getProjectStore
 
 
 class BlockingProcessor:

@@ -23,10 +23,10 @@ from pathlib import Path
 import pytest
 import rarfile
 
-from app.documents import analyze, extractText
-from app.localChunkStore import ENV_TEST_MODE, LocalChunkStore
-from app.ragIngestionPipeline import ChunkingStrategy, RagIngestionPipeline
-from app.ragSelector import RagSelector
+from app.ingestion.documents import analyze, extractText
+from app.ingestion.ragIngestionPipeline import ChunkingStrategy, RagIngestionPipeline
+from app.ingestion.ragSelector import RagSelector
+from app.stores.localChunkStore import ENV_TEST_MODE, LocalChunkStore
 
 # Parsing db-3 twice takes about a minute on its own; skip the module with
 # `pytest -m "not slow"` when that is not worth waiting for.

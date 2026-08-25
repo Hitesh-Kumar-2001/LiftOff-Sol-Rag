@@ -7,10 +7,7 @@ from collections.abc import Iterator
 
 import pytest
 
-from app.chunkStoreFactory import buildChunkStore
-from app.localChunkStore import ENV_TEST_MODE, LocalChunkStore, fileNameFor
-from app.pineconeChunkStore import PineconeChunkStore
-from app.ragIngestionPipeline import (
+from app.ingestion.ragIngestionPipeline import (
     MAX_EMBED_TOKENS,
     Chunk,
     ChunkingStrategy,
@@ -20,6 +17,9 @@ from app.ragIngestionPipeline import (
     countTokens,
     enforceEmbedLimit,
 )
+from app.stores.chunkStoreFactory import buildChunkStore
+from app.stores.localChunkStore import ENV_TEST_MODE, LocalChunkStore, fileNameFor
+from app.stores.pineconeChunkStore import PineconeChunkStore
 
 
 @pytest.fixture

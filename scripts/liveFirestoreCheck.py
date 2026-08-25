@@ -1,12 +1,20 @@
-"""Check FirestoreJobManager against real Firestore.
+"""Check FirestoreProjectStore against real Firestore.
 
-    GOOGLE_APPLICATION_CREDENTIALS=keys/<key>.json \
-    GCP_PROJECT_ID=<project> python scripts/liveFirestoreCheck.py
+    python scripts/liveFirestoreCheck.py
 
-Covers what a stand-in cannot: that jobs round-trip through Firestore, that a
-second instance sees the first's jobs, and that the conflict check holds when
-two submissions race -- which is the whole reason for moving the table out of
-process memory.
+Configuration comes from .env -- GCP_PROJECT_ID (the switch that selects
+Firestore at all), GOOGLE_APPLICATION_CREDENTIALS (omit it inside GCP) and
+FIRESTORE_DATABASE_ID. Environment variables set on the command line still win.
+
+Firestore holds one thing now: the projectId -> ragDbId mapping. It is also the
+one record whose loss cannot be recovered from -- hand a project a second
+ragDbId and everything ingested under the first is stranded in Pinecone,
+billable and unreachable -- so what matters here is that resolving is stable and
+that two processes racing a project's first submission agree on one id.
+
+Covers what a stand-in cannot: that the mapping round-trips through the real
+service, that a second client sees the first's writes, and that the transaction
+in resolveOrCreate actually holds when two of them collide.
 
 Cleans up the documents it creates.
 """
@@ -17,94 +25,75 @@ import asyncio
 import os
 import sys
 
-from app.jobs import Job, JobConflictError, JobStatus
+# Imported purely for its side effect: ``app/__init__.py`` calls
+# ``load_dotenv()``, and without it the guard in ``main`` reads an environment
+# that .env has not reached yet -- so a fully configured checkout would still
+# exit claiming GCP_PROJECT_ID is unset, and the only way to run this would be
+# to repeat on the command line what .env already says. Everything under ``app``
+# that reads config at import time is imported below that guard, so this one
+# line is enough to make the file the single source of configuration.
+import app  # noqa: F401
 
-RAG_DB = "live-firestore-check"
-LINK = "https://example.com/handbook.pdf"
-OTHER_LINK = "https://example.com/other.pdf"
+PROJECT_ID = "live-firestore-check"
+OTHER_PROJECT_ID = "live-firestore-check-second"
 
 failures: list[str] = []
 
 
-def check(label: str, actual, expected) -> None:
-    ok = actual == expected
-    print(f"  {'ok ' if ok else 'FAIL'}  {label}: {actual!r}" + ("" if ok else f" != {expected!r}"))
-    if not ok:
-        failures.append(label)
-
-
-class SlowProcessor:
-    """Holds a job in PROCESSING until released, so a race can be staged."""
-
-    def __init__(self) -> None:
-        self.release = asyncio.Event()
-        self.started = asyncio.Event()
-
-    async def process(self, job: Job) -> None:
-        # Nothing is downloaded or ingested: this check is about the job table,
-        # and a real document would only add Pinecone and Gemini to what could
-        # fail. runJob ignores the return value and reads the job's status.
-        self.started.set()
-        await self.release.wait()
+def check(description: str, condition: bool) -> None:
+    print(f"  {'ok  ' if condition else 'FAIL'}  {description}")
+    if not condition:
+        failures.append(description)
 
 
 async def main() -> None:
     if not os.environ.get("GCP_PROJECT_ID"):
         sys.exit("Set GCP_PROJECT_ID (and GOOGLE_APPLICATION_CREDENTIALS).")
 
-    from app.firestoreJobManager import FirestoreJobManager
-    from app.firestoreJobStore import COLLECTION, firestoreClient
+    from app.infra.firestoreClient import firestoreClient
+    from app.stores.projectStore import COLLECTION, FirestoreProjectStore
 
-    processor = SlowProcessor()
-    manager = FirestoreJobManager(processor)
+    store = FirestoreProjectStore()
     collection = firestoreClient().collection(COLLECTION)
-    collection.document(RAG_DB).delete()
 
     try:
-        print(f"collection: {COLLECTION}\n")
+        print("\n=== resolving a project that has never been seen")
+        check("an unknown project resolves to nothing", await store.resolve(PROJECT_ID) is None)
 
-        print("a submitted job is written to Firestore")
-        job = await manager.create(serverId="svc", documentLink=LINK, ragDbId=RAG_DB)
-        await processor.started.wait()
-        check("job id", job.jobId, RAG_DB)
-        stored = collection.document(RAG_DB).get().to_dict()
-        check("stored in Firestore", stored is not None, True)
-        check("status recorded", stored["status"], "processing")
-        check("link recorded", stored["documentLink"], LINK)
+        print("\n=== first submission mints a database")
+        ragDbId = await store.resolveOrCreate(PROJECT_ID)
+        check("a ragDbId was minted", bool(ragDbId))
+        check("it is not the projectId", ragDbId != PROJECT_ID)
+        check("resolving now finds it", await store.resolve(PROJECT_ID) == ragDbId)
 
-        print("\na second instance, with its own empty memory, sees the job")
-        # The failure this replaces: a fresh JobManager knows nothing, so
-        # /document/status answered "no such job" for a running one.
-        second = FirestoreJobManager(processor)
-        seen = await second.get(RAG_DB)
-        check("found by another instance", seen is not None, True)
-        check("same document", seen.documentLink if seen else None, LINK)
+        print("\n=== the mapping is stable")
+        check("resolveOrCreate returns the same id", await store.resolveOrCreate(PROJECT_ID) == ragDbId)
 
-        print("\nthe same document again is deduplicated, not re-run")
-        again = await manager.create(serverId="svc", documentLink=LINK, ragDbId=RAG_DB)
-        check("same job returned", again.jobId, RAG_DB)
+        print("\n=== a second client sees it")
+        # The whole reason this is not in process memory.
+        check("another instance resolves the same id", await FirestoreProjectStore().resolve(PROJECT_ID) == ragDbId)
 
-        print("\na different document mid-ingest is refused across instances")
-        try:
-            await second.create(serverId="svc", documentLink=OTHER_LINK, ragDbId=RAG_DB)
-            check("conflict raised", False, True)
-        except JobConflictError:
-            check("conflict raised", True, True)
+        print("\n=== two first submissions racing")
+        # The transaction is the only thing stopping these minting two ids and
+        # leaving one ingestion writing to a namespace nothing resolves to.
+        first, second = await asyncio.gather(
+            FirestoreProjectStore().resolveOrCreate(OTHER_PROJECT_ID),
+            FirestoreProjectStore().resolveOrCreate(OTHER_PROJECT_ID),
+        )
+        check("both racers agree on one ragDbId", first == second)
 
-        print("\nthe final status is written back when the job finishes")
-        processor.release.set()
-        await manager.shutdown()
-        stored = collection.document(RAG_DB).get().to_dict()
-        check("final status", stored["status"], JobStatus.DONE.value)
-
-        print("\nand a later instance reads that finished job")
-        check("status seen by another instance", (await second.get(RAG_DB)).status, JobStatus.DONE)
+        print("\n=== different projects get different databases")
+        check("they are not the same", await store.resolve(PROJECT_ID) != await store.resolve(OTHER_PROJECT_ID))
     finally:
-        collection.document(RAG_DB).delete()
-        print(f"\ncleaned up '{RAG_DB}'")
+        print("\n=== cleanup")
+        for projectId in (PROJECT_ID, OTHER_PROJECT_ID):
+            collection.document(projectId).delete()
+            print(f"  deleted {projectId}")
 
-    print("\n" + ("FAILURES: " + ", ".join(failures) if failures else "all checks passed"))
-    sys.exit(1 if failures else 0)
+    print()
+    if failures:
+        sys.exit(f"{len(failures)} check(s) failed: {failures}")
+    print("All checks passed.")
 
 
 if __name__ == "__main__":
