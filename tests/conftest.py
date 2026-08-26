@@ -109,6 +109,42 @@ class FirestoreScratch:
                 pass
 
 
+@pytest.fixture(scope="session", autouse=True)
+def fakeRedisEverywhere():
+    """Give the whole suite a Redis that needs no server.
+
+    The in-process job manager is gone, so ``buildJobManager`` requires
+    REDIS_URL and the API refuses to start without it -- which is right for a
+    deployment and would otherwise mean every test needed a running Redis.
+    ``fakeredis`` is a full implementation in the process, including the
+    WATCH/MULTI the claim depends on, so the *real* ``QueuedJobManager`` and
+    ``RedisJobStore`` are what these tests exercise. Only the server is fake.
+
+    Patched at the source and at every module that bound the name at import
+    time: ``redisClient`` is imported directly by ``app.jobs.jobManager``, so
+    replacing it only in ``app.infra`` would leave that copy pointing at the
+    original.
+    """
+    import fakeredis
+
+    from app.infra import redisClient as redisModule
+    from app.jobs import jobManager as jobManagerModule
+
+    shared = fakeredis.FakeRedis(decode_responses=True)
+    patch = pytest.MonkeyPatch()
+    patch.setenv("REDIS_URL", "redis://fake-for-tests")
+    patch.setattr(redisModule, "redisClient", lambda: shared)
+    patch.setattr(jobManagerModule, "redisClient", lambda: shared)
+
+    # Anything built before the patch landed would be holding the real client.
+    jobManagerModule.getJobManager.cache_clear()
+    try:
+        yield shared
+    finally:
+        patch.undo()
+        jobManagerModule.getJobManager.cache_clear()
+
+
 @pytest.fixture
 def scratch():
     """Per-test scratch ids, cleaned up however the test ends."""

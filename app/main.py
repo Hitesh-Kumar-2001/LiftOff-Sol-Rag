@@ -44,6 +44,12 @@ def checkConfiguration() -> None:
     getProjectStore()
     getChatStore()
     getChunkStore()
+    # Also a configuration question rather than a connectivity one: is
+    # REDIS_URL set, and is it set alongside the GCP project durable jobs need
+    # to be resolvable. Built here rather than at import so that importing
+    # app.jobs.jobManager -- which routes.py does for the exception types --
+    # does not itself require a working environment.
+    getJobManager()
 
 
 @asynccontextmanager

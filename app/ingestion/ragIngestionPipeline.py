@@ -9,6 +9,20 @@ Chunks are stored under a caller-supplied ``ragDbId`` -- the id of the RAG
 database being populated, not the source URL -- so re-ingesting a different
 document into the same ``ragDbId`` overwrites what's there, same as a job
 resubmission under an existing ``ragDbId`` (see ``app.jobs.jobManager``).
+
+**Every CPU-bound step runs in a thread.** ``split``, ``chunkWithoutAi``,
+``enforceEmbedLimit`` and ``buildChunks`` are ordinary synchronous functions,
+and awaiting them directly held the event loop for the length of the whole
+document -- minutes on a large corpus. Nothing else in the process ran during
+that: not another request, and not the health check, so a platform watching the
+service concluded it was dead and killed a task that was working perfectly.
+
+The reason a thread is enough, rather than a process: tiktoken's encode and
+decode are Rust and release the GIL, and they are almost all of the cost.
+``split`` is a single ``re`` pass and ``re`` does *not* release the GIL, so that
+one still blocks -- but it is one pass over the text rather than one per chunk,
+which is a far smaller window and not worth the cost of shipping megabytes of
+text to another process to avoid.
 """
 
 from __future__ import annotations
@@ -213,6 +227,19 @@ def chunkWithoutAi(
     return chunks
 
 
+def buildChunks(texts: list[str]) -> list["Chunk"]:
+    """Attach an index and a token count to every chunk.
+
+    Split out of ``runText`` so the whole loop can be handed to a thread in one
+    go: it is a tiktoken pass per chunk, which on a large corpus is tens of
+    thousands of encodes and seconds of solid CPU.
+    """
+    return [
+        Chunk(text=text, index=index, tokenCount=countTokens(text))
+        for index, text in enumerate(texts)
+    ]
+
+
 def enforceEmbedLimit(chunks: list[str]) -> list[str]:
     """Re-split anything an embedder would silently truncate.
 
@@ -324,8 +351,9 @@ def parseAiChunks(raw: str | None) -> list[str]:
 class ChunkStore(Protocol):
     """Where finished chunks end up, keyed by ``ragDbId``.
 
-    Three implementations exist: ``InMemoryChunkStore`` here,
-    ``app.stores.localChunkStore.LocalChunkStore`` for tests, and
+    Two implementations exist:
+    ``app.stores.localChunkStore.LocalChunkStore``, which writes JSON files and
+    refuses to construct without RAG_TEST_MODE, and
     ``app.stores.pineconeChunkStore.PineconeChunkStore`` for real use. Nothing in
     this module knows which one it has.
     """
@@ -339,32 +367,19 @@ class ChunkStore(Protocol):
     async def search(self, ragDbId: str, query: str, topK: int) -> list[SearchResult]: ...
 
 
-class InMemoryChunkStore:
-    def __init__(self) -> None:
-        self.byRagDbId: dict[str, list[Chunk]] = {}
-
-    async def save(self, ragDbId: str, chunks: list[Chunk]) -> None:
-        self.byRagDbId[ragDbId] = chunks
-
-    async def get(self, ragDbId: str) -> list[Chunk]:
-        return self.byRagDbId.get(ragDbId, [])
-
-    async def delete(self, ragDbId: str) -> None:
-        self.byRagDbId.pop(ragDbId, None)
-
-    async def search(self, ragDbId: str, query: str, topK: int = 5) -> list[SearchResult]:
-        return lexicalSearch(await self.get(ragDbId), query, topK)
-
-
 class RagIngestionPipeline:
     """load -> split -> chunk -> store."""
 
     def __init__(
         self,
-        store: ChunkStore | None = None,
+        store: ChunkStore,
         aiChunker: Callable[[list[str]], Awaitable[list[str]]] | None = None,
     ) -> None:
-        self.store = store or InMemoryChunkStore()
+        # Required, with no default. It used to fall back to a dict, which made
+        # "I forgot to pass a store" indistinguishable from a successful
+        # ingestion: chunks landed somewhere, the job went DONE, and the
+        # vectors existed nowhere any later search could reach them.
+        self.store = store
         # Injectable so a test can exercise the AI *path* -- selection,
         # chunking, storage -- without a per-section call to a paid API for
         # every section of a million-token corpus.
@@ -396,23 +411,24 @@ class RagIngestionPipeline:
         """
         texts = await self.chunk(text, strategy)
 
-        chunks = [
-            Chunk(text=chunkText, index=i, tokenCount=countTokens(chunkText))
-            for i, chunkText in enumerate(texts)
-        ]
+        # Another full tokenisation pass, so it goes to a thread as well.
+        chunks = await asyncio.to_thread(buildChunks, texts)
         await self.store.save(ragDbId, chunks)
 
         return IngestedDocument(ragDbId=ragDbId, sourceUrl=sourceUrl, chunks=chunks)
 
     async def chunk(self, text: str, strategy: ChunkingStrategy) -> list[str]:
         chunks = await self.chunkBy(text, strategy)
-        return enforceEmbedLimit(chunks)
+        # Off the loop: one tiktoken pass per chunk, and there can be tens of
+        # thousands of them. See the note on threads in the module docstring.
+        return await asyncio.to_thread(enforceEmbedLimit, chunks)
 
     async def chunkBy(self, text: str, strategy: ChunkingStrategy) -> list[str]:
         if strategy is ChunkingStrategy.RAW:
+            # A strip on text already in memory. Not worth a thread hop.
             return [text.strip()] if text.strip() else []
 
-        sections = split(text)
+        sections = await asyncio.to_thread(split, text)
         if strategy is ChunkingStrategy.AI:
             return await self.aiChunker(sections)
-        return chunkWithoutAi(sections)
+        return await asyncio.to_thread(chunkWithoutAi, sections)

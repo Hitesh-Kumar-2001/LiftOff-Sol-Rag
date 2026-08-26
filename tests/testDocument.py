@@ -7,8 +7,9 @@ from fastapi.testclient import TestClient
 
 from app.ingestion.documents import StubDocumentProcessor
 from app.jobs.job import Job
-from app.jobs.jobManager import JobManager, getJobManager
+from app.jobs.jobManager import getJobManager
 from app.main import app
+from fakeJobManager import LocalJobManager
 from app.stores.projectStore import FirestoreProjectStore, getProjectStore
 
 
@@ -23,7 +24,7 @@ class BlockingProcessor:
 def clientUsing(processor) -> Generator[TestClient]:
     # One manager per test, not one per request -- a fresh instance per call
     # would make jobs vanish between the create and any later lookup.
-    jobManager = JobManager(processor)
+    jobManager = LocalJobManager(processor)
     # Likewise one mapping per test, and a fresh one each time: the real store
     # is a process-wide singleton, so without this a projectId minted by one
     # test would still resolve in the next -- and "never submitted" would stop

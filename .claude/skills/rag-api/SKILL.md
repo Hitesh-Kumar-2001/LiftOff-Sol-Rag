@@ -34,8 +34,10 @@ machine stats).
 the test suite (they cost money / need network): `liveFirestoreCheck` (project mapping),
 `liveChatCheck` (chat store — the append transaction and the summary range queries),
 `livePineconeCheck` (store), `liveIngestionCheck <url>` (whole pipeline, real Gemini
-and Pinecone). They read `.env`; `tests/conftest.py` deliberately unsets
-`GCP_PROJECT_ID` so the *suite* never does.
+and Pinecone). They read `.env`. **The suite reads it too** — there are no in-process
+stores, so `tests/conftest.py` requires `GCP_PROJECT_ID` and runs against real Firestore,
+prefixing every id per run and deleting what it created. Redis is `fakeredis`, in-process,
+so the real `QueuedJobManager` and `RedisJobStore` are exercised without a server.
 
 ## Endpoints
 
@@ -53,12 +55,13 @@ in the API.
 
 ## Module map
 
-**API layer** — [app/main.py](app/main.py) builds the app (lifespan only awaits
-in-flight jobs on shutdown) and owns the 422 handler that allowlists `type`/`loc`/`msg`
+**API layer** — [app/main.py](app/main.py) builds the app (the lifespan runs
+`checkConfiguration()` so a bad config fails the deploy, and awaits in-flight jobs on
+shutdown) and owns the 422 handler that allowlists `type`/`loc`/`msg`
 so a malformed request is not echoed back. [app/api/routes.py](app/api/routes.py) has the four
 routes and is where `projectId` becomes `ragDbId`. [app/api/schemas.py](app/api/schemas.py) is
 the wire contract. [app/stores/projectStore.py](app/stores/projectStore.py) holds the mapping —
-`ProjectStore` protocol, in-memory and Firestore implementations, `buildProjectStore()`
+`ProjectStore` protocol, the Firestore implementation, `buildProjectStore()`
 factory. [app/infra/machineStats.py](app/infra/machineStats.py) reads CPU/memory/disk via `psutil`
 for `/health`.
 
@@ -79,7 +82,7 @@ conversation into prompt + messages, and folds it down when it outgrows
 
 **Chats** — [app/stores/chatStore.py](app/stores/chatStore.py) is the storage:
 `ragChats/{projectId}/chats/{chatId}` with `messages` and `context` subcollections,
-Redis in front, `ChatStore` protocol + in-memory + Firestore + factory. Full schema and
+Redis in front, `ChatStore` protocol + Firestore + factory. Full schema and
 rationale in [docs/chatSchema.md](docs/chatSchema.md) — read that before changing
 anything about how a conversation is stored.
 
@@ -87,8 +90,8 @@ anything about how a conversation is stored.
 
 **Jobs** — [app/jobs/job.py](app/jobs/job.py) is the `Job` record, `JobStatus`, `runJob`, the
 `JobStore` protocol, and `resolveSubmission` (the shared NEW/REUSE/CONFLICT rules).
-[app/jobs/jobManager.py](app/jobs/jobManager.py) picks the manager from the environment and
-holds the in-memory one. [app/jobs/redisJobStore.py](app/jobs/redisJobStore.py) is the table —
+[app/jobs/jobManager.py](app/jobs/jobManager.py) is the `JobManager` Protocol, the
+environment-driven `buildJobManager()`, and the lazily built, lru_cached `getJobManager()`. [app/jobs/redisJobStore.py](app/jobs/redisJobStore.py) is the table —
 storage only, and the claim is a WATCH/MULTI transaction.
 [app/jobs/queuedJobManager.py](app/jobs/queuedJobManager.py) claims then enqueues;
 [app/jobs/jobQueue.py](app/jobs/jobQueue.py) is the Redis list and its crash recovery;
@@ -127,18 +130,32 @@ the tail instead of erroring.
 
 ## Where things run
 
-`REDIS_URL` picks the whole shape. **There is no silent fallback** — Redis without
-`GCP_PROJECT_ID` raises at startup.
+**There is exactly one shape, and no in-process fallback anywhere.** `REDIS_URL` and
+`GCP_PROJECT_ID` are both required; each of `buildJobManager`, `buildProjectStore` and
+`buildChatStore` raises without them, and `app.main.checkConfiguration` calls all of them
+in the lifespan so a misconfigured deployment fails at **startup** rather than 500ing every
+request behind a green `/health`.
 
-| `REDIS_URL` | `GCP_PROJECT_ID` | Job table | Work runs | Survives restart |
-| --- | --- | --- | --- | --- |
-| — | — | dict in-process | API's event loop | no |
-| — | set | dict in-process | API's event loop | mapping does; jobs do not |
-| set | set | Redis | `python -m app.jobs.worker` | yes |
+| Needs | Holds | Work runs |
+| --- | --- | --- |
+| `REDIS_URL` | job table + queue | `python -m app.jobs.worker` |
+| `GCP_PROJECT_ID` | `projectId`→`ragDbId` mapping, chats, prompts | — |
+
+The dict-backed job manager, `InMemoryProjectStore`, `InMemoryChatStore` and
+`InMemoryChunkStore` are all gone. They were two problems, not one: state died with the
+process, and the job manager ran chunking on the API's own event loop, so a large document
+froze every other request — health check included — and the platform killed a task that was
+working. `tests/fakeJobManager.py` keeps the dict version as a *test double*, which is what
+it was always suited to; it calls `resolveSubmission` rather than reimplementing the rules.
 
 Redis-without-Firestore is refused because durable jobs resolved through a mapping that
 dies on restart is the worst of both: `/document/status` would 404 running jobs, and a
 resubmitted project would mint a second `ragDbId` and orphan the first one's vectors.
+
+**Every CPU-bound ingestion step runs in a thread** (`split`, `chunkWithoutAi`,
+`enforceEmbedLimit`, `buildChunks`). tiktoken releases the GIL and is nearly all of the
+cost; `re` does not, so `split` still blocks briefly — one pass over the text rather than
+one per chunk.
 
 Celery was removed as overkill for one node. It bought horizontal scaling, routing, a
 result backend and a scheduler, none of which were used, and cost a broker abstraction
@@ -161,7 +178,7 @@ so no misconfiguration can quietly downgrade a real deployment.
 2. **A project's `ragDbId` is minted once and never changes.** Mint a second and
    everything ingested under the first is stranded in Pinecone: billable, unreachable,
    invisible. `resolveOrCreate` must therefore be atomic — a Firestore transaction, or
-   the in-memory lock — or two concurrent first submissions mint two ids.
+   — or two concurrent first submissions mint two ids.
 3. **Only `/document` may create a mapping.** `/search`, `/query`, and `/status` resolve
    read-only, or every mistyped `projectId` leaves an empty database behind forever.
 4. **`ragDbId` is random, not derived from `projectId`.** Nothing may recompute one from
@@ -173,7 +190,7 @@ so no misconfiguration can quietly downgrade a real deployment.
    caller could never learn about a 409.
 7. **The queue message carries only the `ragDbId`.** The worker re-reads the job from
    the table. A copy in the message would be a second source of truth.
-8. **`resolveSubmission` is the single copy of the reuse/conflict rules.** The in-memory
+8. **`resolveSubmission` is the single copy of the reuse/conflict rules.** The test double in `tests/fakeJobManager.py`
    manager calls it directly; `RedisJobStore.claim` calls it inside its WATCH/MULTI
    retry. Do not reimplement it per backend, and do not move it into a Lua script —
    drift would surface as the same request accepted on one deployment and refused on
@@ -198,8 +215,14 @@ so no misconfiguration can quietly downgrade a real deployment.
    a retry is requested.
 14. **Ingestion writes and search reads must be the same store instance** —
     `getChunkStore()` is `lru_cache`d for exactly that reason.
-15. **Startup fails loudly** on a misconfigured job backend. A config typo should
-    surface on deploy, not on the first request.
+15. **Startup fails loudly on any misconfiguration**, via `app.main.checkConfiguration`:
+    the job manager and all three stores are built in the lifespan. None of those
+    constructors touch the network, so this checks configuration rather than
+    availability. A config typo must surface on deploy, not on the first request — left
+    lazy, every request 500s while `/health` answers `ok` and the platform routes all
+    traffic to a task that cannot serve any of it. The counterpart rule is that
+    everything *after* startup degrades instead of crashing: see 24, and
+    `primeCpuPercent`, which is guarded precisely because it runs in the lifespan.
 16. **`/health` must not fail, and must not be slow.** Every machine reading is
     taken independently and dropped on error — a liveness endpoint that 500s because
     it could not stat a filesystem pulls a working service out of a load balancer.
@@ -267,10 +290,11 @@ so no misconfiguration can quietly downgrade a real deployment.
   `DocumentProcessor`. Add a backend by writing the class and returning it from the factory.
 - Blocking SDKs (Firestore, Pinecone, kombu publish) are always wrapped in
   `asyncio.to_thread`.
-- Process-wide singletons: `JOB_MANAGER` is built at import time, so **env vars must be
-  set before importing `app.jobs.jobManager`** — the live scripts set them at the top of the
-  file for this reason. `getChunkStore()` and `getProjectStore()` are `lru_cache`d and
-  built lazily instead.
+- Process-wide singletons are **all** `lru_cache`d and built lazily: `getJobManager()`,
+  `getProjectStore()`, `getChatStore()`, `getChunkStore()`. Importing a module no longer
+  requires a working environment — that used to be true of `JOB_MANAGER` and was a
+  standing footgun. `app.main.checkConfiguration` builds all four during startup, so
+  laziness costs nothing in fail-fast behaviour.
 - Lines wrap around 100 chars. No linter is configured.
 - Tests are `tests/test*.py` (per `pyproject.toml`), use `TestClient` plus
   `app.dependency_overrides`, and mark corpus tests `pytest.mark.slow`.
