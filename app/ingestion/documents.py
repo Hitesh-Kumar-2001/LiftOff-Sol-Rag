@@ -9,10 +9,16 @@ unpacked and every supported member analyzed the same way, so its
 ``DocumentMetadata.sourceKind`` is ``"folder"``; anything else is ``"single"``.
 
 Unlike zip, rar has no format-decoding logic in Python's standard library --
-``rarfile`` shells out to an ``unrar`` (or ``bsdtar``/``7z``) binary that must
-already be on the machine. If it isn't, opening a ``.rar`` raises a clear
-error rather than the library's own exception, which is otherwise easy to
-mistake for a corrupt archive.
+``rarfile`` shells out to an external binary (``unar``, ``unrar``, ``7z`` or
+``bsdtar``, in that order of preference) that must already be on the machine.
+The Dockerfile installs ``unar`` and ``bsdtar`` for exactly this, and asserts at
+build time that one of them resolves, because otherwise a missing package is
+invisible until a real ``.rar`` arrives in production. If none is found, opening
+a ``.rar`` raises a clear error rather than the library's own exception, which
+is otherwise easy to mistake for a corrupt archive.
+
+The corpora here are RAR5, which rules out the older free ``unrar`` builds --
+whatever backend is installed has to read format 5, not just format 4.
 
 What "processing" means beyond metadata extraction -- chunking, embedding,
 writing into a ``ragDbId`` -- is still undecided; this module only answers
@@ -38,10 +44,18 @@ import pdfplumber
 import rarfile
 import tiktoken
 
-# Where to find the unrar/bsdtar/7z binary rarfile shells out to. Not on every
-# machine by default the way zip support is -- override per-environment with
-# RAG_UNRAR_TOOL if it isn't on PATH under its usual name.
-rarfile.UNRAR_TOOL = os.environ.get("RAG_UNRAR_TOOL", rarfile.UNRAR_TOOL)
+# Which binary reads .rar. Deployment is Linux, where the Dockerfile installs
+# `unar` and `bsdtar` and rarfile finds one of them on PATH by itself -- leaving
+# this unset is the normal case and the one production runs in.
+#
+# The override exists for development machines where the tool is present but
+# not on PATH under a name rarfile probes for: on Windows, WinRAR ships
+# UnRAR.exe under Program Files and nothing else is installed, so RAG_UNRAR_TOOL
+# points at it. Setting it *replaces* rarfile's first choice rather than adding
+# to the chain, so an override naming a missing file still falls through to
+# unar/7z/bsdtar rather than failing outright.
+if os.environ.get("RAG_UNRAR_TOOL"):
+    rarfile.UNRAR_TOOL = os.environ["RAG_UNRAR_TOOL"]
 
 if TYPE_CHECKING:
     # Only needed for the type hint below -- importing it for real would make
@@ -344,9 +358,11 @@ def _analyzeArchiveEntries(
         # bytes does. That means this can fail partway through the walk --
         # raised as one clear error instead of leaving `files` half-built.
         raise ArchiveToolMissingError(
-            "Cannot read .rar archives: no unrar/bsdtar/7z tool found "
-            f"(looked for '{rarfile.UNRAR_TOOL}'). Install one, or point "
-            "RAG_UNRAR_TOOL at its path."
+            "Cannot read .rar archives: no unar/unrar/7z/bsdtar tool found "
+            f"(rarfile's first choice is '{rarfile.UNRAR_TOOL}'). On Debian or "
+            "Ubuntu: apt-get install unar libarchive-tools -- the Dockerfile "
+            "already does this, so seeing it in a container means the image was "
+            "built without them. Elsewhere, point RAG_UNRAR_TOOL at the binary."
         ) from exc
 
     return files

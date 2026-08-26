@@ -8,6 +8,34 @@ ENV PYTHONDONTWRITEBYTECODE=1
 # Send logs directly to Docker
 ENV PYTHONUNBUFFERED=1
 
+# .rar is the one archive format Python cannot read on its own: `rarfile` shells
+# out to an external binary, and unlike zip there is nothing in the standard
+# library behind it. The corpora here are RAR5, and the choice of binary is not
+# a matter of taste -- it was measured against a real 200-file RAR5 archive:
+#
+#   unrar (this one)  200/200 members read correctly
+#   unar              195/200; the other five come back as ZERO bytes, silently
+#   bsdtar            0/200; returns 51 bytes for a 39KB member, silently
+#
+# Both free alternatives fail by *truncating*, not by erroring, and
+# app.ingestion.documents._archiveText deliberately skips a member it cannot
+# read rather than losing the whole document -- so either of them would build a
+# RAG database quietly missing files. Hence the official unrar, which lives in
+# Debian's non-free component. Its licence permits redistributing and using the
+# decoder; what it forbids is reusing the source to build a RAR *compressor*.
+RUN echo "deb http://deb.debian.org/debian bookworm main non-free non-free-firmware" \
+      > /etc/apt/sources.list.d/nonfree.list \
+    && apt-get update \
+    && apt-get install -y --no-install-recommends unrar \
+    && rm -rf /var/lib/apt/lists/*
+
+# tiktoken downloads its BPE data on first use. Without a writable cache that
+# download happens on every cold start, and on a task with restricted egress it
+# fails outright -- taking ingestion down for a reason that looks nothing like
+# a network policy.
+ENV TIKTOKEN_CACHE_DIR=/app/.tiktoken
+RUN mkdir -p /app/.tiktoken
+
 # Install uv
 COPY --from=ghcr.io/astral-sh/uv:latest /uv /uvx /bin/
 
@@ -17,6 +45,12 @@ COPY pyproject.toml uv.lock ./
 
 # Install production dependencies
 RUN uv sync --frozen --no-dev
+
+# Fail the build, not a production upload, if the rar backend cannot read RAR5.
+# Checks extracted bytes against the size in the archive header, because the
+# failure being guarded against is silent truncation rather than an exception.
+COPY docker ./docker
+RUN uv run python docker/checkRarBackend.py
 
 # Copy application
 COPY app ./app

@@ -8,7 +8,7 @@ from app.ingestion.ragIngestionPipeline import Chunk, lexicalSearch
 from app.main import app
 from app.stores.chunkStoreFactory import getChunkStore
 from app.stores.localChunkStore import ENV_TEST_MODE, LocalChunkStore
-from app.stores.projectStore import InMemoryProjectStore, getProjectStore
+from app.stores.projectStore import FirestoreProjectStore, getProjectStore
 
 CHUNKS = [
     Chunk(text="Refunds are issued within 30 days of purchase.", index=0, tokenCount=9),
@@ -17,15 +17,35 @@ CHUNKS = [
 ]
 
 
+# Project ids come from the scratch workspace rather than being literals: these
+# tests write to real Firestore, so a fixed name like "handbook" would be shared
+# by every run on every machine. `named` returns one id per name per test, so
+# several requests in one test reach one project, while the next test's
+# "handbook" is a project that has never existed.
+_SCRATCH = None
+
+
+@pytest.fixture(autouse=True)
+def _scratchWorkspace(scratch):
+    global _SCRATCH
+    _SCRATCH = scratch
+    yield
+    _SCRATCH = None
+
+
+def pid(name: str) -> str:
+    return _SCRATCH.named(name)
+
+
 @pytest.fixture
 def client(tmp_path, monkeypatch) -> Iterator[TestClient]:
     monkeypatch.setenv(ENV_TEST_MODE, "1")
-    projectStore = InMemoryProjectStore()
+    projectStore = FirestoreProjectStore()
     # The chunks are stored under the ragDbId the route will resolve to, not
     # under the project id. Storing them by project id would pass only because
     # the two happened to be the same string -- exactly the assumption this
     # indirection exists to break.
-    ragDbId = asyncio.run(projectStore.resolveOrCreate("handbook"))
+    ragDbId = asyncio.run(projectStore.resolveOrCreate(pid("handbook")))
 
     store = LocalChunkStore(root=tmp_path)
     asyncio.run(store.save(ragDbId, CHUNKS))
@@ -40,7 +60,7 @@ def client(tmp_path, monkeypatch) -> Iterator[TestClient]:
 def body(**overrides) -> dict:
     payload = {
         "serverId": "billing-service",
-        "projectId": "handbook",
+        "projectId": pid("handbook"),
         "query": "refund",
     }
     return payload | overrides
@@ -51,7 +71,7 @@ def testAQueryReturnsTheMatchingChunk(client: TestClient) -> None:
 
     assert response.status_code == 200
     payload = response.json()
-    assert payload["projectId"] == "handbook"
+    assert payload["projectId"] == pid("handbook")
     assert payload["hits"], "expected at least one hit"
     assert "Refunds are issued" in payload["hits"][0]["text"]
 
@@ -85,7 +105,7 @@ def testAQueryMatchingNothingReturnsNoHits(client: TestClient) -> None:
 def testAnUningestedDatabaseReturnsNoHits(client: TestClient) -> None:
     """Nothing was stored under this id, which is the same answer as nothing
     matching -- not a 404."""
-    response = client.post("/api/v1/search", json=body(projectId="never-ingested"))
+    response = client.post("/api/v1/search", json=body(projectId=pid("never-ingested")))
 
     assert response.status_code == 200
     assert response.json()["hits"] == []
@@ -96,19 +116,19 @@ def testSearchingAnUnknownProjectCreatesNoDatabase(client: TestClient) -> None:
     projectId would leave an empty one behind forever."""
     projects = app.dependency_overrides[getProjectStore]()
 
-    client.post("/api/v1/search", json=body(projectId="mistyped"))
+    client.post("/api/v1/search", json=body(projectId=pid("mistyped")))
 
-    assert asyncio.run(projects.resolve("mistyped")) is None
+    assert asyncio.run(projects.resolve(pid("mistyped"))) is None
 
 
 def testTheInternalRagDbIdIsNeverReturned(client: TestClient) -> None:
     """The caller gets back the project it asked about, not where the chunks
     turned out to live."""
-    ragDbId = asyncio.run(app.dependency_overrides[getProjectStore]().resolve("handbook"))
+    ragDbId = asyncio.run(app.dependency_overrides[getProjectStore]().resolve(pid("handbook")))
 
     response = client.post("/api/v1/search", json=body(query="refunds purchase"))
 
-    assert response.json()["projectId"] == "handbook"
+    assert response.json()["projectId"] == pid("handbook")
     assert response.json()["hits"], "expected the search to have actually matched"
     assert ragDbId not in response.text
 

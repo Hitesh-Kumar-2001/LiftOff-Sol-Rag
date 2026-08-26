@@ -51,8 +51,18 @@ def primeCpuPercent() -> None:
     100ms, and this endpoint is the one a load balancer hits every few
     seconds. Blocking the event loop on every one of those to sharpen a
     diagnostic number is the wrong trade.
+
+    Swallows its failure, like every reading below it. This one is called from
+    the lifespan hook rather than from a request, so an exception here does not
+    spoil a diagnostic figure -- it propagates out of startup and the
+    application never comes up at all. On a platform where psutil cannot read
+    /proc that is a container which crash-loops forever over a number nothing
+    depends on. It was the only call in this module not already covered.
     """
-    psutil.cpu_percent(interval=None)
+    try:
+        psutil.cpu_percent(interval=None)
+    except Exception:
+        logger.warning("Could not prime the CPU measurement window.", exc_info=True)
 
 
 def cpuStats() -> CpuStats | None:

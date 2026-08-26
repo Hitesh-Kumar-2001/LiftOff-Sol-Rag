@@ -9,7 +9,7 @@ from app.ingestion.documents import StubDocumentProcessor
 from app.jobs.job import Job
 from app.jobs.jobManager import JobManager, getJobManager
 from app.main import app
-from app.stores.projectStore import InMemoryProjectStore, getProjectStore
+from app.stores.projectStore import FirestoreProjectStore, getProjectStore
 
 
 class BlockingProcessor:
@@ -28,7 +28,7 @@ def clientUsing(processor) -> Generator[TestClient]:
     # is a process-wide singleton, so without this a projectId minted by one
     # test would still resolve in the next -- and "never submitted" would stop
     # meaning that.
-    projectStore = InMemoryProjectStore()
+    projectStore = FirestoreProjectStore()
 
     app.dependency_overrides[getJobManager] = lambda: jobManager
     app.dependency_overrides[getProjectStore] = lambda: projectStore
@@ -37,6 +37,26 @@ def clientUsing(processor) -> Generator[TestClient]:
             yield testClient
     finally:
         app.dependency_overrides.clear()
+
+
+# Project ids come from the scratch workspace rather than being literals: these
+# tests write to real Firestore, so a fixed name like "handbook" would be shared
+# by every run on every machine. `named` returns one id per name per test, so
+# several requests in one test reach one project, while the next test's
+# "handbook" is a project that has never existed.
+_SCRATCH = None
+
+
+@pytest.fixture(autouse=True)
+def _scratchWorkspace(scratch):
+    global _SCRATCH
+    _SCRATCH = scratch
+    yield
+    _SCRATCH = None
+
+
+def pid(name: str) -> str:
+    return _SCRATCH.named(name)
 
 
 @pytest.fixture
@@ -49,7 +69,7 @@ def body(**overrides: str) -> dict[str, str]:
     payload = {
         "serverId": "billing-service",
         "documentLink": "https://example.com/handbook.pdf",
-        "projectId": "handbook",
+        "projectId": pid("handbook"),
     }
     return payload | overrides
 
@@ -64,7 +84,7 @@ def testASubmissionGetsItsProjectIdBack(client: TestClient) -> None:
     response = client.post("/api/v1/document", json=body())
 
     assert response.status_code == 202
-    assert response.json() == {"projectId": "handbook", "status": "queued"}
+    assert response.json() == {"projectId": pid("handbook"), "status": "queued"}
 
 
 def testTheInternalRagDbIdIsNeverReturned(client: TestClient) -> None:
@@ -72,36 +92,36 @@ def testTheInternalRagDbIdIsNeverReturned(client: TestClient) -> None:
     nothing that names where its chunks actually live."""
     response = client.post("/api/v1/document", json=body())
 
-    ragDbId = resolve("handbook")
+    ragDbId = resolve(pid("handbook"))
     assert ragDbId is not None, "the submission should have minted a database"
     assert ragDbId not in response.text
     assert "ragDbId" not in response.text
 
 
 def testEachProjectGetsItsOwnDatabase(client: TestClient) -> None:
-    client.post("/api/v1/document", json=body(projectId="handbook"))
-    client.post("/api/v1/document", json=body(projectId="policies"))
+    client.post("/api/v1/document", json=body(projectId=pid("handbook")))
+    client.post("/api/v1/document", json=body(projectId=pid("policies")))
 
-    assert resolve("handbook") != resolve("policies")
+    assert resolve(pid("handbook")) != resolve(pid("policies"))
 
 
 def testResubmittingAProjectReusesItsDatabase(client: TestClient) -> None:
     """A project's ragDbId is minted once and never again. Minting a second
     would strand the first document's chunks in a namespace nothing resolves
     to -- still in Pinecone, still billable, unreachable by any request."""
-    client.post("/api/v1/document", json=body(projectId="handbook"))
-    first = resolve("handbook")
+    client.post("/api/v1/document", json=body(projectId=pid("handbook")))
+    first = resolve(pid("handbook"))
 
-    client.post("/api/v1/document", json=body(projectId="handbook"))
+    client.post("/api/v1/document", json=body(projectId=pid("handbook")))
 
-    assert resolve("handbook") == first
+    assert resolve(pid("handbook")) == first
 
 
 def testResubmittingTheSameDocumentIsAccepted(client: TestClient) -> None:
     """The stub finishes immediately, so this is the settled case: the same
     document again is a duplicate, not a conflict."""
-    first = client.post("/api/v1/document", json=body(projectId="handbook"))
-    second = client.post("/api/v1/document", json=body(projectId="handbook"))
+    first = client.post("/api/v1/document", json=body(projectId=pid("handbook")))
+    second = client.post("/api/v1/document", json=body(projectId=pid("handbook")))
 
     assert first.status_code == second.status_code == 202
 
@@ -110,11 +130,11 @@ def testADifferentDocumentMidIngestIsAConflict() -> None:
     """409 rather than 202: nothing was queued, because running it would
     leave the database holding part of each document."""
     with clientUsing(BlockingProcessor()) as client:
-        client.post("/api/v1/document", json=body(projectId="handbook"))
+        client.post("/api/v1/document", json=body(projectId=pid("handbook")))
 
         response = client.post(
             "/api/v1/document",
-            json=body(projectId="handbook", documentLink="https://example.com/other.pdf"),
+            json=body(projectId=pid("handbook"), documentLink="https://example.com/other.pdf"),
         )
 
         assert response.status_code == 409
@@ -123,13 +143,13 @@ def testADifferentDocumentMidIngestIsAConflict() -> None:
 
 def testAConflictQueuesNothing() -> None:
     with clientUsing(BlockingProcessor()) as client:
-        client.post("/api/v1/document", json=body(projectId="handbook"))
+        client.post("/api/v1/document", json=body(projectId=pid("handbook")))
         manager = app.dependency_overrides[getJobManager]()
         before = len(manager)
 
         client.post(
             "/api/v1/document",
-            json=body(projectId="handbook", documentLink="https://example.com/other.pdf"),
+            json=body(projectId=pid("handbook"), documentLink="https://example.com/other.pdf"),
         )
 
         assert len(manager) == before

@@ -2,6 +2,7 @@
 route's contract: validation, what it hands the agent, and what it does when
 the agent cannot run at all. The loop inside is tests/testAgent.py."""
 
+import asyncio
 from collections.abc import Iterator
 
 import pytest
@@ -12,27 +13,42 @@ from app.agent.llmManager import LlmConfigError
 from app.agent.reviewer import ReviewOutcome
 from app.api import routes
 from app.main import app
-from app.stores.chatStore import ChatStoreError, InMemoryChatStore, getChatStore
-from app.stores.projectStore import InMemoryProjectStore, getProjectStore
+from app.stores.chatStore import ChatStoreError, FirestoreChatStore, getChatStore
+from app.stores.projectStore import FirestoreProjectStore, getProjectStore
+
+# The project every request in this module names. Rebound per test by the
+# autouse fixture below to a scratch id, so these tests can write to real
+# Firestore without two runs -- or a run and a real project -- colliding on a
+# fixed name like "handbook". A module global rather than a fixture argument
+# only because ``body()`` is called from every test in the file.
+PROJECT_ID = "unset"
+
+
+@pytest.fixture(autouse=True)
+def projectId(scratch) -> Iterator[str]:
+    global PROJECT_ID
+    PROJECT_ID = scratch.projectId("query")
+    yield PROJECT_ID
+    PROJECT_ID = "unset"
 
 
 @pytest.fixture
-def projectStore() -> Iterator[InMemoryProjectStore]:
-    store = InMemoryProjectStore()
+def projectStore(projectId) -> Iterator[FirestoreProjectStore]:
+    store = FirestoreProjectStore()
     app.dependency_overrides[getProjectStore] = lambda: store
     yield store
     app.dependency_overrides.clear()
 
 
 @pytest.fixture
-def chatStore(projectStore) -> InMemoryChatStore:
-    """A fresh chat store per test.
+def chatStore(projectStore) -> FirestoreChatStore:
+    """The real chat store, overriding the lru_cached process-wide one.
 
-    Overridden rather than left to the factory: ``getChatStore`` is lru_cached
-    process-wide, so without this one test's conversations would still be there
-    for the next one.
+    No Redis in front: a cache hit would answer a read without Firestore, and
+    a test asserting what was stored would then be asserting what was
+    remembered.
     """
-    store = InMemoryChatStore()
+    store = FirestoreChatStore(redis=None)
     app.dependency_overrides[getChatStore] = lambda: store
     return store
 
@@ -76,7 +92,7 @@ def body(**overrides: str) -> dict[str, str]:
     payload = {
         "serverId": "billing-service",
         "question": "What is the refund window?",
-        "projectId": "handbook",
+        "projectId": PROJECT_ID,
     }
     return payload | overrides
 
@@ -86,7 +102,7 @@ def testAQuestionGetsTheAgentsAnswer(client: TestClient) -> None:
 
     assert response.status_code == 200
     payload = response.json()
-    assert payload["projectId"] == "handbook"
+    assert payload["projectId"] == PROJECT_ID
     assert payload["answer"] == "Thirty days from purchase."
 
 
@@ -96,7 +112,7 @@ def testAQuestionWithNoChatIdStartsOneAndReturnsIt(client: TestClient, chatStore
 
     chatId = response.json()["chatId"]
     assert chatId
-    assert len(chatStore) == 1
+    assert asyncio.run(chatStore.loadWindow(PROJECT_ID, chatId)) is not None
 
 
 def testTheFirstTurnOfANewChatHasNoHistory(client: TestClient, calls) -> None:
@@ -171,11 +187,11 @@ def testAnUnknownChatIdIsA404(client: TestClient) -> None:
     assert response.status_code == 404
 
 
-def testAChatIsScopedToItsProject(client: TestClient) -> None:
+def testAChatIsScopedToItsProject(client: TestClient, scratch) -> None:
     chatId = client.post("/api/v1/query", json=body()).json()["chatId"]
 
     response = client.post(
-        "/api/v1/query", json=body(projectId="another-project", chatId=chatId)
+        "/api/v1/query", json=body(projectId=scratch.projectId("other"), chatId=chatId)
     )
 
     assert response.status_code == 404
@@ -216,32 +232,32 @@ def testAFailedWriteDoesNotLoseTheAnswer(client: TestClient, monkeypatch, chatSt
 
 def testTheAgentIsGivenTheProjectsDatabase(client: TestClient, calls, projectStore) -> None:
     """Resolved here so the agent's search tool can be bound to it."""
-    import asyncio
-
-    ragDbId = asyncio.run(projectStore.resolveOrCreate("handbook"))
+    ragDbId = asyncio.run(projectStore.resolveOrCreate(PROJECT_ID))
 
     client.post("/api/v1/query", json=body())
 
     assert calls[0]["ragDbId"] == ragDbId
-    assert calls[0]["projectId"] == "handbook"
+    assert calls[0]["projectId"] == PROJECT_ID
     assert calls[0]["question"] == "What is the refund window?"
 
 
-def testAnUningestedProjectStillAnswers(client: TestClient, calls) -> None:
+def testAnUningestedProjectStillAnswers(client: TestClient, calls, scratch) -> None:
     """Asking a question does not create a database. The agent runs with no
     search tool rather than the request 404ing."""
-    response = client.post("/api/v1/query", json=body(projectId="never-ingested"))
+    response = client.post(
+        "/api/v1/query", json=body(projectId=scratch.projectId("never-ingested"))
+    )
 
     assert response.status_code == 200
     assert calls[0]["ragDbId"] is None
 
 
-def testQueryingDoesNotCreateADatabase(client: TestClient, projectStore) -> None:
-    import asyncio
+def testQueryingDoesNotCreateADatabase(client: TestClient, projectStore, scratch) -> None:
+    mistyped = scratch.projectId("mistyped")
 
-    client.post("/api/v1/query", json=body(projectId="mistyped"))
+    client.post("/api/v1/query", json=body(projectId=mistyped))
 
-    assert asyncio.run(projectStore.resolve("mistyped")) is None
+    assert asyncio.run(projectStore.resolve(mistyped)) is None
 
 
 def testAnUnconfiguredAgentIsA503(monkeypatch, projectStore) -> None:

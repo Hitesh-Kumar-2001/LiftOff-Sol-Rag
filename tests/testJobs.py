@@ -249,3 +249,27 @@ def testDifferentDatabasesNeverConflict() -> None:
 
 def testShutdownWithNoJobsReturnsImmediately() -> None:
     asyncio.run(JobManager(StubDocumentProcessor()).shutdown())
+
+
+def testAFailingOnStartLeavesTheJobFailedNotWedged() -> None:
+    """``onStart`` writes PROCESSING to a durable table, so it is a network
+    call that can fail.
+
+    It used to sit outside ``runJob``'s try block, so that failure escaped onto
+    a bare background task nobody awaits: the job stayed PROCESSING for the life
+    of the process, /document/status answered 'processing' forever, and since
+    the claim was never released every resubmission of that project answered
+    409. A failed job at least says why and can be resubmitted.
+    """
+    from app.jobs.job import runJob
+
+    async def brokenOnStart(job: Job) -> None:
+        raise RuntimeError("job table unreachable")
+
+    job = Job(jobId="handbook", serverId="svc", documentLink=LINK)
+
+    # The point of the assertion: this returns rather than raising.
+    asyncio.run(runJob(job, StubDocumentProcessor(), onStart=brokenOnStart))
+
+    assert job.status is JobStatus.FAILED
+    assert "job table unreachable" in job.detail

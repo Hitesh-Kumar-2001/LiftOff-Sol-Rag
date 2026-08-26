@@ -1,9 +1,14 @@
 """Chat storage: turn indices, the summary watermarks, and the cache in front.
 
-What matters here is that appending a turn cannot lose an exchange, that a
-summarised chat stops reading the documents it folded away, and that a cache hit
-does not touch Firestore at all -- that last one is the whole reason the cache
-exists, and it is invisible from the outside unless a test asserts it.
+The storage tests run against real Firestore. What matters is that appending a
+turn cannot lose an exchange -- which is a claim about a transaction, and a
+claim no dict can be asked to support -- and that a summarised chat stops
+reading the documents it folded away, which is a claim about a range query
+resolving with no composite index defined.
+
+The cache tests below use a fake Firestore on purpose: there, the whole point
+is proving Firestore is *not* reached, which needs a client that fails loudly if
+it is.
 """
 
 import asyncio
@@ -17,26 +22,25 @@ from app.stores.chatStore import (
     ChatWindow,
     ContextEntry,
     FirestoreChatStore,
-    InMemoryChatStore,
+    buildChatStore,
 )
 
-PROJECT = "handbook"
 PROMPT = "You are the handbook assistant."
 
 
 @pytest.fixture
-def store() -> InMemoryChatStore:
-    return InMemoryChatStore()
+def projectId(scratch) -> str:
+    return scratch.projectId("chat")
 
 
 @pytest.fixture
-def chat(store: InMemoryChatStore) -> ChatWindow:
+def chat(chats, projectId) -> ChatWindow:
     return asyncio.run(
-        store.createChat(projectId=PROJECT, systemPrompt=PROMPT, ragDbId="handbook-abc123")
+        chats.createChat(projectId=projectId, systemPrompt=PROMPT, ragDbId="handbook-abc123")
     )
 
 
-# --- the in-memory store ---------------------------------------------------
+# --- storage ---------------------------------------------------------------
 
 
 def testANewChatStartsEmpty(chat: ChatWindow) -> None:
@@ -46,22 +50,22 @@ def testANewChatStartsEmpty(chat: ChatWindow) -> None:
     assert chat.systemPrompt == PROMPT
 
 
-def testAnUnknownChatIsNoneRatherThanAnError(store: InMemoryChatStore) -> None:
+def testAnUnknownChatIsNoneRatherThanAnError(chats, projectId) -> None:
     """The caller turns None into a 404 and an exception into a degraded
     answer, so the two must not collapse into one."""
-    assert asyncio.run(store.loadWindow(PROJECT, "never-existed")) is None
+    assert asyncio.run(chats.loadWindow(projectId, "never-existed")) is None
 
 
-def testAChatIsScopedToItsProject(store: InMemoryChatStore, chat: ChatWindow) -> None:
-    assert asyncio.run(store.loadWindow("another-project", chat.chatId)) is None
+def testAChatIsScopedToItsProject(chats, chat, scratch) -> None:
+    other = scratch.projectId("other")
+
+    assert asyncio.run(chats.loadWindow(other, chat.chatId)) is None
 
 
-def testAppendingStoresBothHalvesOfTheExchange(
-    store: InMemoryChatStore, chat: ChatWindow
-) -> None:
-    asyncio.run(store.appendTurn(window=chat, question="Refunds?", answer="30 days.", context=[]))
+def testAppendingStoresBothHalvesOfTheExchange(chats, chat, projectId) -> None:
+    asyncio.run(chats.appendTurn(window=chat, question="Refunds?", answer="30 days.", context=[]))
 
-    stored = asyncio.run(store.loadWindow(PROJECT, chat.chatId))
+    stored = asyncio.run(chats.loadWindow(projectId, chat.chatId))
     assert [(m.turnIndex, m.role, m.content) for m in stored.messages] == [
         (0, "user", "Refunds?"),
         (1, "assistant", "30 days."),
@@ -69,23 +73,20 @@ def testAppendingStoresBothHalvesOfTheExchange(
     assert stored.turnCount == 2
 
 
-def testTurnIndicesKeepCountingAcrossTurns(
-    store: InMemoryChatStore, chat: ChatWindow
-) -> None:
-    """Indices come from the stored counter, not from the caller's window --
-    which is what stops two concurrent turns writing the same document id."""
-    window = asyncio.run(store.appendTurn(window=chat, question="One?", answer="A.", context=[]))
-    window = asyncio.run(store.appendTurn(window=window, question="Two?", answer="B.", context=[]))
+def testTurnIndicesKeepCountingAcrossTurns(chats, chat) -> None:
+    """Indices come from the stored counter inside the transaction, not from
+    the caller's window -- which is what stops two concurrent turns writing the
+    same document id and losing one of them."""
+    window = asyncio.run(chats.appendTurn(window=chat, question="One?", answer="A.", context=[]))
+    window = asyncio.run(chats.appendTurn(window=window, question="Two?", answer="B.", context=[]))
 
     assert [m.turnIndex for m in window.messages] == [0, 1, 2, 3]
     assert window.turnCount == 4
 
 
-def testRetrievalsAreStoredAgainstTheTurnThatCausedThem(
-    store: InMemoryChatStore, chat: ChatWindow
-) -> None:
+def testRetrievalsAreStoredAgainstTheTurnThatCausedThem(chats, chat, projectId) -> None:
     asyncio.run(
-        store.appendTurn(
+        chats.appendTurn(
             window=chat,
             question="Refunds?",
             answer="30 days.",
@@ -93,40 +94,35 @@ def testRetrievalsAreStoredAgainstTheTurnThatCausedThem(
         )
     )
 
-    stored = asyncio.run(store.loadWindow(PROJECT, chat.chatId))
+    stored = asyncio.run(chats.loadWindow(projectId, chat.chatId))
     assert stored.context[0].turnIndex == 0
     assert stored.context[0].entryIndex == 0
     assert stored.context[0].passages == ["Refunds: 30 days."]
     assert stored.contextCount == 1
 
 
-def testAppendingToAChatThatIsNotThereIsAnError(store: InMemoryChatStore) -> None:
-    ghost = ChatWindow(chatId="ghost", projectId=PROJECT, systemPrompt=PROMPT)
+def testAppendingToAChatThatIsNotThereIsAnError(chats, projectId) -> None:
+    ghost = ChatWindow(chatId="ghost", projectId=projectId, systemPrompt=PROMPT)
 
     with pytest.raises(ChatStoreError):
-        asyncio.run(store.appendTurn(window=ghost, question="?", answer="!", context=[]))
+        asyncio.run(chats.appendTurn(window=ghost, question="?", answer="!", context=[]))
 
 
-def testALoadedWindowIsDetachedFromTheStore(
-    store: InMemoryChatStore, chat: ChatWindow
-) -> None:
-    """The summariser mutates the window it is handed. Without a copy that
-    would edit the stored conversation behind the store's back."""
-    asyncio.run(store.appendTurn(window=chat, question="Q", answer="A", context=[]))
+def testTheSystemPromptIsSnapshotted(chats, chat, projectId) -> None:
+    """A prompt edited mid-conversation must not rewrite the instructions the
+    earlier answers were given under."""
+    asyncio.run(chats.appendTurn(window=chat, question="Q", answer="A", context=[]))
 
-    window = asyncio.run(store.loadWindow(PROJECT, chat.chatId))
-    window.messages.clear()
-
-    assert len(asyncio.run(store.loadWindow(PROJECT, chat.chatId)).messages) == 2
+    assert asyncio.run(chats.loadWindow(projectId, chat.chatId)).systemPrompt == PROMPT
 
 
-def testASummaryReplacesWhatItCovers(store: InMemoryChatStore, chat: ChatWindow) -> None:
-    """The point of a summary: the documents below the watermark are never
-    read again, so a long conversation stops getting more expensive."""
+def testASummaryReplacesWhatItCovers(chats, chat, projectId) -> None:
+    """The point of a summary: the documents below the watermark are never read
+    again, so a long conversation stops getting more expensive."""
     window = chat
     for number in range(3):
         window = asyncio.run(
-            store.appendTurn(
+            chats.appendTurn(
                 window=window,
                 question=f"Q{number}",
                 answer=f"A{number}",
@@ -135,8 +131,8 @@ def testASummaryReplacesWhatItCovers(store: InMemoryChatStore, chat: ChatWindow)
         )
 
     asyncio.run(
-        store.saveSummary(
-            projectId=PROJECT,
+        chats.saveSummary(
+            projectId=projectId,
             chatId=chat.chatId,
             summary="They asked three things.",
             throughTurn=4,
@@ -144,12 +140,53 @@ def testASummaryReplacesWhatItCovers(store: InMemoryChatStore, chat: ChatWindow)
         )
     )
 
-    stored = asyncio.run(store.loadWindow(PROJECT, chat.chatId))
+    stored = asyncio.run(chats.loadWindow(projectId, chat.chatId))
     assert stored.contextSummary == "They asked three things."
     assert [m.turnIndex for m in stored.messages] == [4, 5]
     assert [c.entryIndex for c in stored.context] == [2]
     # The counters still describe the whole chat, not the surviving tail.
     assert stored.turnCount == 6
+
+
+def testAppendingContinuesPastASummary(chats, chat, projectId) -> None:
+    window = chat
+    for number in range(3):
+        window = asyncio.run(
+            chats.appendTurn(window=window, question=f"Q{number}", answer=f"A{number}", context=[])
+        )
+    asyncio.run(
+        chats.saveSummary(
+            projectId=projectId,
+            chatId=chat.chatId,
+            summary="earlier",
+            throughTurn=4,
+            throughContext=0,
+        )
+    )
+
+    folded = asyncio.run(chats.loadWindow(projectId, chat.chatId))
+    after = asyncio.run(chats.appendTurn(window=folded, question="Q3", answer="A3", context=[]))
+
+    assert after.turnCount == 8
+    assert after.contextSummary == "earlier"
+
+
+@pytest.mark.slow
+def testConcurrentTurnsDoNotLoseAnExchange(chats, chat, projectId) -> None:
+    """The transaction is the only thing stopping two questions arriving
+    together from both claiming turn 0 and one exchange vanishing."""
+
+    async def race() -> None:
+        await asyncio.gather(
+            chats.appendTurn(window=chat, question="One?", answer="A.", context=[]),
+            chats.appendTurn(window=chat, question="Two?", answer="B.", context=[]),
+        )
+
+    asyncio.run(race())
+
+    stored = asyncio.run(chats.loadWindow(projectId, chat.chatId))
+    assert stored.turnCount == 4
+    assert sorted(m.turnIndex for m in stored.messages) == [0, 1, 2, 3]
 
 
 # --- the window itself -----------------------------------------------------
@@ -160,7 +197,7 @@ def testAWindowSurvivesAJsonRoundTrip() -> None:
     dataclasses rather than as dicts."""
     window = ChatWindow(
         chatId="c1",
-        projectId=PROJECT,
+        projectId="p1",
         systemPrompt=PROMPT,
         contextSummary="earlier",
         turnCount=2,
@@ -176,12 +213,14 @@ def testAWindowSurvivesAJsonRoundTrip() -> None:
 
 
 # --- the Redis cache in front of Firestore ---------------------------------
+#
+# Fake clients here, because the assertion is about what is *not* called.
 
 
 class ExplodingFirestore:
     """Any use at all is a failure. Proves a cache hit never reaches Firestore."""
 
-    def collection(self, name):  # pragma: no cover - only called when the test fails
+    def collection(self, name):  # pragma: no cover - only reached when the test fails
         raise AssertionError("Firestore was read on what should have been a cache hit.")
 
 
@@ -194,15 +233,13 @@ def testACachedWindowNeverReachesFirestore(redis) -> None:
     store = FirestoreChatStore(firestore=ExplodingFirestore(), redis=redis)
     window = ChatWindow(
         chatId="c1",
-        projectId=PROJECT,
+        projectId="p1",
         systemPrompt=PROMPT,
         messages=[ChatMessage(0, "user", "hello")],
     )
-    redis.set(store.cacheKey(PROJECT, "c1"), window.toJson())
+    redis.set(store.cacheKey("p1", "c1"), window.toJson())
 
-    loaded = asyncio.run(store.loadWindow(PROJECT, "c1"))
-
-    assert loaded == window
+    assert asyncio.run(store.loadWindow("p1", "c1")) == window
 
 
 def testAnUnreadableStoreRaisesRatherThanAnsweringEmpty(redis) -> None:
@@ -216,7 +253,7 @@ def testAnUnreadableStoreRaisesRatherThanAnsweringEmpty(redis) -> None:
     store = FirestoreChatStore(firestore=BrokenFirestore(), redis=redis)
 
     with pytest.raises(ChatStoreError):
-        asyncio.run(store.loadWindow(PROJECT, "c1"))
+        asyncio.run(store.loadWindow("p1", "c1"))
 
 
 def testACacheFailureIsNotAnError() -> None:
@@ -242,4 +279,16 @@ def testACacheFailureIsNotAnError() -> None:
 
     store = FirestoreChatStore(firestore=EmptyFirestore(), redis=BrokenRedis())
 
-    assert asyncio.run(store.loadWindow(PROJECT, "c1")) is None
+    assert asyncio.run(store.loadWindow("p1", "c1")) is None
+
+
+# --- the factory -----------------------------------------------------------
+
+
+def testWithoutAGcpProjectTheStoreRefusesToBuild(monkeypatch) -> None:
+    """No in-process fallback: one would drop every conversation on restart
+    while the service looked perfectly healthy."""
+    monkeypatch.delenv("GCP_PROJECT_ID", raising=False)
+
+    with pytest.raises(RuntimeError, match="GCP_PROJECT_ID"):
+        buildChatStore()

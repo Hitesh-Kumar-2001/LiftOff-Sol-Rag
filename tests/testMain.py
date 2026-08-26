@@ -93,3 +93,46 @@ def testRoot() -> None:
 
     assert response.status_code == 200
     assert response.json() == {"message": "RAG API is running"}
+
+
+# --- startup: what must, and must not, stop the process coming up ----------
+
+
+def testAFailingCpuPrimeDoesNotStopStartup(monkeypatch) -> None:
+    """The measurement primer runs in the lifespan hook, so unlike the readings
+    it guards nothing downstream -- an exception there propagates out of startup
+    and the application never comes up. On a platform where psutil cannot read
+    /proc that is a container crash-looping over a diagnostic number."""
+
+    def broken(*args, **kwargs):
+        raise RuntimeError("no /proc here")
+
+    monkeypatch.setattr(machineStatsModule.psutil, "cpu_percent", broken)
+
+    with TestClient(app) as started:
+        assert started.get("/health").status_code == 200
+
+
+def testAMisconfiguredDeploymentFailsAtStartup(monkeypatch) -> None:
+    """Deliberately fatal, and deliberately *at startup*.
+
+    Left to build lazily, the first request would raise instead: every request
+    would 500 while /health went on answering ok, so a platform would shift all
+    traffic onto a task that cannot serve any of it and keep it there. Refusing
+    to start stops the rollout and leaves the previous version running.
+    """
+    from app.main import checkConfiguration
+    from app.stores.chatStore import getChatStore
+    from app.stores.projectStore import getProjectStore
+
+    monkeypatch.delenv("GCP_PROJECT_ID", raising=False)
+    getProjectStore.cache_clear()
+    getChatStore.cache_clear()
+    try:
+        with pytest.raises(RuntimeError, match="GCP_PROJECT_ID"):
+            checkConfiguration()
+    finally:
+        # The caches are process-wide; leaving a failed build cached, or a
+        # store built without a GCP project, would follow every later test.
+        getProjectStore.cache_clear()
+        getChatStore.cache_clear()

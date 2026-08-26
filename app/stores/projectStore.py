@@ -79,34 +79,6 @@ class ProjectStore(Protocol):
         ...
 
 
-class InMemoryProjectStore:
-    """The mapping in a dict. Single process, and gone on restart."""
-
-    def __init__(self) -> None:
-        self._byProjectId: dict[str, str] = {}
-        self._lock = asyncio.Lock()
-
-    async def resolve(self, projectId: str) -> str | None:
-        return self._byProjectId.get(projectId)
-
-    async def resolveOrCreate(self, projectId: str) -> str:
-        existing = self._byProjectId.get(projectId)
-        if existing is not None:
-            return existing
-
-        async with self._lock:
-            # Re-checked inside the lock: two submissions for a new project can
-            # both miss above, and the first through will have written it by
-            # the time the second acquires. Without this they mint two ids and
-            # one document lands in a namespace nothing resolves to.
-            if projectId not in self._byProjectId:
-                self._byProjectId[projectId] = newRagDbId(projectId)
-            return self._byProjectId[projectId]
-
-    def __len__(self) -> int:
-        return len(self._byProjectId)
-
-
 class FirestoreProjectStore:
     """The mapping in a Firestore collection keyed by ``projectId``.
 
@@ -170,35 +142,36 @@ class FirestoreProjectStore:
 
 
 def buildProjectStore() -> ProjectStore:
-    """Pick the mapping store from the environment.
+    """The mapping store. Firestore, or nothing.
 
-    Firestore when a GCP project is named. ``app.jobs.jobManager`` refuses to
-    start a Redis deployment without it, because durable jobs resolved through
-    a mapping that dies on restart is the worst of both.
+    There is deliberately no in-process fallback. This mapping is the only
+    record of where a project's chunks live, so a store that dies with the
+    process is not a lesser version of this one -- it is a way to lose a
+    project's vectors: the next submission for that projectId mints a *new*
+    ragDbId and everything under the old one stays in Pinecone, billable and
+    unreachable. A deployment that quietly started without Firestore would look
+    healthy right up until the first restart.
+
+    Tests run against real Firestore too (see ``tests/conftest.py``), which is
+    the only way the transaction in ``resolveOrCreate`` is ever really
+    exercised -- a dict with a lock agrees with itself by construction.
     """
-    if os.environ.get("GCP_PROJECT_ID"):
-        return FirestoreProjectStore()
-
-    # Worth a warning rather than a quiet default. This mapping is the only
-    # record of where a project's chunks live: lose it on a restart and the
-    # next submission for that projectId mints a *new* ragDbId, leaving the
-    # previously ingested vectors in Pinecone, billable, and unreachable. That
-    # is fine for tests and local runs (where RAG_TEST_MODE usually means there
-    # are no real vectors at all) and wrong for anything else.
-    logger.warning(
-        "No GCP_PROJECT_ID: the projectId -> ragDbId mapping is in memory and will "
-        "not survive a restart. Previously ingested chunks become unreachable if it "
-        "is lost."
-    )
-    return InMemoryProjectStore()
+    if not os.environ.get("GCP_PROJECT_ID"):
+        raise RuntimeError(
+            "GCP_PROJECT_ID is not set, so the projectId -> ragDbId mapping has "
+            "nowhere to live. Set it (and GOOGLE_APPLICATION_CREDENTIALS outside "
+            "GCP) -- this mapping is the only record of where a project's vectors "
+            "are, and there is no in-process substitute for it."
+        )
+    return FirestoreProjectStore()
 
 
 @lru_cache(maxsize=1)
 def getProjectStore() -> ProjectStore:
     """FastAPI dependency: the process-wide project store.
 
-    One instance for the life of the process, same as ``getChunkStore``. With
-    the in-memory implementation this is what makes a mapping outlive the
-    request that created it at all.
+    One instance for the life of the process, same as ``getChunkStore``: the
+    Firestore client underneath owns a connection pool, and building one per
+    request would open a new pool per request.
     """
     return buildProjectStore()

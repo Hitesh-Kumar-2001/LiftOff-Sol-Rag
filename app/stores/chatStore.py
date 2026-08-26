@@ -288,114 +288,6 @@ class ChatStore(Protocol):
         ...
 
 
-class InMemoryChatStore:
-    """Chats in a dict. Single process, and gone on restart.
-
-    The development and test backend, and the reason ``/query`` keeps working
-    on a checkout with no GCP project configured.
-    """
-
-    def __init__(self) -> None:
-        self._chats: dict[tuple[str, str], ChatWindow] = {}
-        self._lock = asyncio.Lock()
-
-    async def createChat(
-        self, *, projectId: str, systemPrompt: str, ragDbId: str | None, title: str = ""
-    ) -> ChatWindow:
-        window = ChatWindow(
-            chatId=newChatId(),
-            projectId=projectId,
-            systemPrompt=systemPrompt,
-            ragDbId=ragDbId,
-        )
-        async with self._lock:
-            self._chats[(projectId, window.chatId)] = window
-        return window.copy()
-
-    async def loadWindow(self, projectId: str, chatId: str) -> ChatWindow | None:
-        stored = self._chats.get((projectId, chatId))
-        # Copied, because the summariser mutates the window it is handed. The
-        # Firestore implementation gets this for free by rebuilding from
-        # documents; this one has to be explicit or a caller edits the store.
-        return None if stored is None else stored.copy()
-
-    async def appendTurn(
-        self,
-        *,
-        window: ChatWindow,
-        question: str,
-        answer: str,
-        context: list[ContextEntry],
-        reviewScore: float | None = None,
-        retried: bool = False,
-    ) -> ChatWindow:
-        async with self._lock:
-            stored = self._chats.get((window.projectId, window.chatId))
-            if stored is None:
-                raise ChatStoreError(
-                    f"No chat '{window.chatId}' in project '{window.projectId}'."
-                )
-
-            timestamp = _isoOf(_now())
-            turnIndex = stored.turnCount
-            stored.messages.append(
-                ChatMessage(
-                    turnIndex=turnIndex,
-                    role="user",
-                    content=question[:MAX_MESSAGE_CHARS],
-                    createdAt=timestamp,
-                )
-            )
-            stored.messages.append(
-                ChatMessage(
-                    turnIndex=turnIndex + 1,
-                    role="assistant",
-                    content=answer[:MAX_MESSAGE_CHARS],
-                    createdAt=timestamp,
-                    reviewScore=reviewScore,
-                    retried=retried,
-                )
-            )
-            stored.turnCount = turnIndex + 2
-
-            for entry in context:
-                stored.context.append(
-                    ContextEntry(
-                        entryIndex=stored.contextCount,
-                        turnIndex=turnIndex,
-                        query=entry.query,
-                        passages=[p[:MAX_PASSAGE_CHARS] for p in entry.passages],
-                        kind=entry.kind,
-                        createdAt=timestamp,
-                    )
-                )
-                stored.contextCount += 1
-
-            return stored.copy()
-
-    async def saveSummary(
-        self,
-        *,
-        projectId: str,
-        chatId: str,
-        summary: str,
-        throughTurn: int,
-        throughContext: int,
-    ) -> None:
-        async with self._lock:
-            stored = self._chats.get((projectId, chatId))
-            if stored is None:
-                return
-            stored.contextSummary = summary
-            stored.summarisedThroughTurn = throughTurn
-            stored.summarisedThroughContext = throughContext
-            stored.messages = [m for m in stored.messages if m.turnIndex >= throughTurn]
-            stored.context = [c for c in stored.context if c.entryIndex >= throughContext]
-
-    def __len__(self) -> int:
-        return len(self._chats)
-
-
 class FirestoreChatStore:
     """Chats in Firestore, with the assembled window cached in Redis.
 
@@ -768,19 +660,27 @@ class FirestoreChatStore:
 
 
 def buildChatStore() -> ChatStore:
-    """Pick the chat store from the environment.
+    """The chat store. Firestore, or nothing.
 
-    The same switch as everything else durable: Firestore when a GCP project is
-    named, a dict otherwise. Redis is picked up when it is there and simply not
-    used when it is not -- unlike the job table, a chat store without a cache is
-    slower rather than wrong, so it is not worth refusing to start over.
+    No in-process fallback, for the same reason as
+    ``app.stores.projectStore.buildProjectStore``: a conversation that dies with
+    the process is not a cheaper version of one that does not, it is a service
+    that silently forgets every conversation on each restart while looking
+    perfectly healthy. Tests run against real Firestore as well, which is the
+    only way the append transaction and the summary range queries are ever
+    actually exercised.
+
+    Redis is different, and stays optional: it caches the assembled window, so
+    losing it costs reads rather than conversations. That is worth degrading
+    for; forgetting the conversation is not.
     """
     if not os.environ.get("GCP_PROJECT_ID"):
-        logger.warning(
-            "No GCP_PROJECT_ID: chat history is in memory and will not survive a "
-            "restart. Every conversation begins again from nothing."
+        raise RuntimeError(
+            "GCP_PROJECT_ID is not set, so chat history has nowhere to live. Set it "
+            "(and GOOGLE_APPLICATION_CREDENTIALS outside GCP) -- there is no "
+            "in-process substitute, because one would drop every conversation on "
+            "restart without anything looking wrong."
         )
-        return InMemoryChatStore()
 
     from app.infra.redisClient import redisClient
 
@@ -796,9 +696,9 @@ def buildChatStore() -> ChatStore:
 def getChatStore() -> ChatStore:
     """FastAPI dependency: the process-wide chat store.
 
-    One instance for the life of the process -- it holds the Firestore and
-    Redis clients, both of which own connection pools -- and, with the
-    in-memory implementation, it is what makes a conversation outlive the
-    request that started it.
+    One instance for the life of the process, because it holds the Firestore
+    and Redis clients and both own connection pools -- building one per request
+    would open a new pool per request and leak connections until the server
+    refused them.
     """
     return buildChatStore()

@@ -202,9 +202,11 @@ class JobStore(Protocol):
 async def runJob(job: Job, processor: "DocumentProcessor", onStart=None) -> None:
     """Execute ``job`` against ``processor``, updating its status as it goes.
 
-    A processor failure is caught and recorded on the job rather than raised,
-    so a caller scheduling this as a background task never sees an unhandled
-    exception surface from that task.
+    A failure anywhere inside is caught and recorded on the job rather than
+    raised, so a caller scheduling this as a background task never sees an
+    unhandled exception surface from that task. That covers ``onStart`` as well
+    as the processor -- both are network calls, and only one of them used to be
+    covered.
 
     ``onStart`` is awaited once the job is PROCESSING but before any work
     begins. It exists for the managers whose table is a *copy* of the job
@@ -217,9 +219,18 @@ async def runJob(job: Job, processor: "DocumentProcessor", onStart=None) -> None
     """
     job.status = JobStatus.PROCESSING
     job.updatedAt = _now()
-    if onStart is not None:
-        await onStart(job)
     try:
+        # Inside the try, not before it. This writes the PROCESSING status to
+        # a durable table, so it is a network call and it can fail -- and left
+        # outside, its failure escaped this function entirely. Under the
+        # in-memory manager that exception lands on a bare background task
+        # nobody awaits: the job stays PROCESSING for the life of the process,
+        # /document/status answers 'processing' forever, and because the claim
+        # is never released every resubmission of that project answers 409.
+        # A wedged project is a worse outcome than a failed one, which at least
+        # says why and can be resubmitted.
+        if onStart is not None:
+            await onStart(job)
         await processor.process(job)
     except asyncio.CancelledError:
         raise

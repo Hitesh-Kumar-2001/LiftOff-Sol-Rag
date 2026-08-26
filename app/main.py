@@ -10,6 +10,9 @@ from app.api.routes import router
 from app.api.schemas import HealthResponse
 from app.infra.machineStats import machineStats, primeCpuPercent
 from app.jobs.jobManager import getJobManager
+from app.stores.chatStore import getChatStore
+from app.stores.chunkStoreFactory import getChunkStore
+from app.stores.projectStore import getProjectStore
 
 logger = logging.getLogger(__name__)
 
@@ -18,12 +21,39 @@ logger = logging.getLogger(__name__)
 SAFE_ERROR_KEYS = ("type", "loc", "msg")
 
 
+def checkConfiguration() -> None:
+    """Build every process-wide store now, so a misconfigured deployment dies
+    at startup instead of serving errors.
+
+    **Deliberately not guarded.** These constructors read configuration -- is
+    GCP_PROJECT_ID set, is the service account key present and parseable, which
+    chunk store did the environment select -- and none of them touches the
+    network, so a failure here means the deployment is wrong rather than that a
+    dependency is briefly unavailable. Retrying will not fix it.
+
+    Left lazy, the first request would build them instead: every request would
+    then 500 while ``/health`` went on answering ``ok``, so the platform would
+    shift all traffic onto a task that cannot serve any of it and keep it there.
+    A container that refuses to start is loud, stops the rollout, and leaves the
+    previous version running. That is the better failure by a wide margin.
+
+    The counterpart rule is that everything *after* startup degrades instead:
+    an unreachable Firestore answers a question without history rather than
+    taking the process down. See ``app.api.routes``.
+    """
+    getProjectStore()
+    getChatStore()
+    getChunkStore()
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     # Start the CPU measurement window now, so the first /health to arrive
     # reports usage since startup rather than the 0.0 psutil returns when it
-    # has nothing to compare against. See app.infra.machineStats.
+    # has nothing to compare against. Cannot raise -- see app.infra.machineStats.
     primeCpuPercent()
+
+    checkConfiguration()
 
     jobs = getJobManager()
     try:
@@ -31,7 +61,17 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     finally:
         # Let in-flight ingestion jobs finish rather than be killed mid-write
         # when the process exits. This waits; it does not cancel.
-        await jobs.shutdown()
+        #
+        # Guarded because it runs while the process is already on its way out.
+        # An exception escaping here replaces whatever actually caused the
+        # shutdown with this one in the logs, and on some servers leaves the
+        # lifespan context unfinished -- turning a clean stop into a hang that
+        # the platform resolves with SIGKILL, which is precisely the abrupt end
+        # this wait exists to avoid.
+        try:
+            await jobs.shutdown()
+        except Exception:
+            logger.exception("Job shutdown failed; exiting anyway.")
 
 
 app = FastAPI(title="RAG API", version="0.1.0", lifespan=lifespan)

@@ -10,7 +10,7 @@ from app.ingestion.ragIngestionPipeline import ChunkingStrategy
 from app.jobs.job import Job, JobStatus
 from app.jobs.jobManager import JobManager, getJobManager
 from app.main import app
-from app.stores.projectStore import InMemoryProjectStore, getProjectStore
+from app.stores.projectStore import FirestoreProjectStore, getProjectStore
 
 
 class SelectingProcessor:
@@ -40,7 +40,7 @@ def clientUsing(processor) -> Generator[TestClient]:
     # Likewise one mapping per test. The real store is a process-wide
     # singleton, so a shared one would leave projects minted by earlier tests
     # still resolving here.
-    projectStore = InMemoryProjectStore()
+    projectStore = FirestoreProjectStore()
 
     app.dependency_overrides[getJobManager] = lambda: jobManager
     app.dependency_overrides[getProjectStore] = lambda: projectStore
@@ -49,6 +49,26 @@ def clientUsing(processor) -> Generator[TestClient]:
             yield testClient
     finally:
         app.dependency_overrides.clear()
+
+
+# Project ids come from the scratch workspace rather than being literals: these
+# tests write to real Firestore, so a fixed name like "handbook" would be shared
+# by every run on every machine. `named` returns one id per name per test, so
+# several requests in one test reach one project, while the next test's
+# "handbook" is a project that has never existed.
+_SCRATCH = None
+
+
+@pytest.fixture(autouse=True)
+def _scratchWorkspace(scratch):
+    global _SCRATCH
+    _SCRATCH = scratch
+    yield
+    _SCRATCH = None
+
+
+def pid(name: str) -> str:
+    return _SCRATCH.named(name)
 
 
 @pytest.fixture
@@ -66,27 +86,27 @@ def rawClient() -> Iterator[TestClient]:
 def body(**overrides: str) -> dict[str, str]:
     payload = {
         "serverId": "billing-service",
-        "projectId": "handbook",
+        "projectId": pid("handbook"),
     }
     return payload | overrides
 
 
-def submit(client: TestClient, projectId: str = "handbook") -> None:
+def submit(client: TestClient, projectId: str | None = None) -> None:
     client.post(
         "/api/v1/document",
         json={
             "serverId": "billing-service",
             "documentLink": "https://example.com/handbook.pdf",
-            "projectId": projectId,
+            "projectId": projectId or pid("handbook"),
         },
     )
 
 
-def waitForDone(client: TestClient, projectId: str = "handbook", attempts: int = 50) -> dict:
+def waitForDone(client: TestClient, projectId: str | None = None, attempts: int = 50) -> dict:
     """The stub processor finishes almost immediately, but on a background
     task -- poll rather than assume it has landed."""
     for _ in range(attempts):
-        payload = client.post("/api/v1/document/status", json=body(projectId=projectId)).json()
+        payload = client.post("/api/v1/document/status", json=body(projectId=projectId or pid("handbook"))).json()
         if payload["status"] == JobStatus.DONE.value:
             return payload
     raise AssertionError(f"job never reached {JobStatus.DONE.value}")
@@ -111,14 +131,14 @@ def testAFinishedJobReportsStatusAndProjectIdOnly(client: TestClient) -> None:
 
     payload = waitForDone(client)
 
-    assert payload == {"status": "done", "projectId": "handbook"}
+    assert payload == {"status": "done", "projectId": pid("handbook")}
 
 
 def testTheInternalRagDbIdIsNeverReturned(client: TestClient) -> None:
     """A caller polls with a projectId and is answered with one. Where the
     chunks actually live stays ours to change."""
     submit(client)
-    ragDbId = asyncio.run(app.dependency_overrides[getProjectStore]().resolve("handbook"))
+    ragDbId = asyncio.run(app.dependency_overrides[getProjectStore]().resolve(pid("handbook")))
 
     response = client.post("/api/v1/document/status", json=body())
 
@@ -146,7 +166,7 @@ def testAChunkedDocumentAnswersWithItsProjectId(strategy: ChunkingStrategy) -> N
 
         payload = waitForDone(client)
 
-        assert payload == {"status": "done", "projectId": "handbook"}
+        assert payload == {"status": "done", "projectId": pid("handbook")}
 
 
 def testTheTwoAnswersAreNeverSentTogether(rawClient: TestClient) -> None:
@@ -167,20 +187,20 @@ def testAJobStillQueuedAnswersWithItsProjectId() -> None:
 
         payload = client.post("/api/v1/document/status", json=body()).json()
 
-        assert payload["projectId"] == "handbook"
+        assert payload["projectId"] == pid("handbook")
         assert "documentLink" not in payload
 
 
 def testTheStatusIsReportedForTheProjectIdAsked(client: TestClient) -> None:
-    submit(client, projectId="policies")
+    submit(client, projectId=pid("policies"))
 
-    payload = client.post("/api/v1/document/status", json=body(projectId="policies")).json()
+    payload = client.post("/api/v1/document/status", json=body(projectId=pid("policies"))).json()
 
-    assert payload["projectId"] == "policies"
+    assert payload["projectId"] == pid("policies")
 
 
 def testAnUnknownProjectIdIsNotFound(client: TestClient) -> None:
-    response = client.post("/api/v1/document/status", json=body(projectId="never-submitted"))
+    response = client.post("/api/v1/document/status", json=body(projectId=pid("never-submitted")))
 
     assert response.status_code == 404
 
