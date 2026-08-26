@@ -1,22 +1,39 @@
-# Local/single-node deployment. Three services, and which of them does the work
-# depends on one variable:
+# Single-node deployment: one host, three containers, one `docker compose up -d`.
 #
-#   REDIS_URL unset  -- the API ingests on its own event loop. `worker` exits
-#                       immediately, saying it has no queue to read. Fine for a
-#                       look around; jobs die with the container.
-#   REDIS_URL set    -- the API only claims the ragDbId and pushes it onto the
-#                       queue, and `worker` is the process that ingests. It also
-#                       needs GCP_PROJECT_ID, or the API refuses to start (see
-#                       app/jobs/jobManager.py for why the pair is required).
+#   api     claims the ragDbId and pushes it onto the queue. Never ingests.
+#   worker  takes ids off the queue and does the ingesting. Exactly ONE of
+#           these -- crash recovery in app/jobs/jobQueue.py reclaims the whole
+#           shared processing list at startup, so a second worker would requeue
+#           the first one's live jobs and run a duplicate ingestion.
+#   redis   the job table and the queue.
 #
-# Inside this network Redis is `redis`, never localhost:
-#   REDIS_URL=redis://redis:6379/0
+# Both REDIS_URL and GCP_PROJECT_ID are required; the API refuses to start
+# without either. There is no in-process mode any more -- it kept the job table
+# in a dict and ran chunking on the API's event loop, blocking every other
+# request including the health check.
+#
+# Redis lives here rather than in the app image on purpose: one process per
+# container, so if it dies the platform can see that and restart it, instead of
+# a supervisor keeping a half-working container alive behind a green /health.
+# Moving to ElastiCache later is a change to REDIS_URL and nothing else.
 services:
   api:
     build: .
     container_name: rag-api
     env_file:
       - .env
+    # Overrides the value in .env, which names localhost for running the API
+    # straight on a dev machine. Inside this network the host is the service
+    # name; `localhost` here would be the container itself.
+    #
+    # RAG_UNRAR_TOOL is blanked deliberately: .env carries a Windows path for
+    # the developer machine, env_file hands it straight to a Linux container,
+    # and the image installs only `unrar` -- so an override naming a path that
+    # cannot exist would leave nothing to fall back to. app/ingestion/documents.py
+    # also ignores an override that is not present, so this is belt and braces.
+    environment:
+      REDIS_URL: redis://redis:6379/0
+      RAG_UNRAR_TOOL: ""
     # keys/ is in .dockerignore -- a service account key must not be baked into
     # an image -- so GOOGLE_APPLICATION_CREDENTIALS only resolves if the
     # directory is mounted in at run time. Read-only: nothing writes here.
@@ -41,6 +58,18 @@ services:
     command: ["uv", "run", "python", "-m", "app.jobs.worker"]
     env_file:
       - .env
+    # Overrides the value in .env, which names localhost for running the API
+    # straight on a dev machine. Inside this network the host is the service
+    # name; `localhost` here would be the container itself.
+    #
+    # RAG_UNRAR_TOOL is blanked deliberately: .env carries a Windows path for
+    # the developer machine, env_file hands it straight to a Linux container,
+    # and the image installs only `unrar` -- so an override naming a path that
+    # cannot exist would leave nothing to fall back to. app/ingestion/documents.py
+    # also ignores an override that is not present, so this is belt and braces.
+    environment:
+      REDIS_URL: redis://redis:6379/0
+      RAG_UNRAR_TOOL: ""
     volumes:
       - ./keys:/app/keys:ro
     depends_on:
@@ -50,12 +79,25 @@ services:
   redis:
     image: redis:7-alpine
     container_name: rag-redis
-    ports:
-      - "6379:6379"
-    # Jobs are working state and their loss is survivable, but losing the table
-    # mid-ingestion strands every claimed ragDbId at a 409 until its TTL runs
-    # out -- days, by default. Cheap enough to persist.
-    command: ["redis-server", "--appendonly", "yes"]
+    # Deliberately NOT published to the host. `redis:7-alpine` ships with
+    # protected-mode off, no password, and bind on every interface -- so a
+    # published 6379 on a public instance is an unauthenticated Redis anyone can
+    # reach, and `CONFIG SET dir` from there writes files as the redis user.
+    # api and worker reach it as `redis:6379` on this network without it. For
+    # local poking, publish to loopback only: "127.0.0.1:6379:6379".
+    #
+    # --appendonly: jobs are working state and their loss is survivable, but
+    # losing the table mid-ingestion strands every claimed ragDbId at a 409
+    # until its TTL runs out -- days, by default. Cheap enough to persist.
+    #
+    # --maxmemory: the default is unlimited, and this shares a host with the
+    # API. Unbounded, Redis grows until the kernel OOM-kills something, and
+    # that something is as likely to be uvicorn as Redis. The eviction policy
+    # is deliberately left at the default `noeviction`: the job table and the
+    # queue live here, so `allkeys-lru` -- the usual advice -- would silently
+    # delete in-flight jobs. Refusing writes at the ceiling surfaces as a 503
+    # on a claim, which is a failure someone can see.
+    command: ["redis-server", "--appendonly", "yes", "--maxmemory", "512mb"]
     volumes:
       - redisData:/data
     healthcheck:

@@ -9,16 +9,15 @@ unpacked and every supported member analyzed the same way, so its
 ``DocumentMetadata.sourceKind`` is ``"folder"``; anything else is ``"single"``.
 
 Unlike zip, rar has no format-decoding logic in Python's standard library --
-``rarfile`` shells out to an external binary (``unar``, ``unrar``, ``7z`` or
-``bsdtar``, in that order of preference) that must already be on the machine.
-The Dockerfile installs ``unar`` and ``bsdtar`` for exactly this, and asserts at
-build time that one of them resolves, because otherwise a missing package is
-invisible until a real ``.rar`` arrives in production. If none is found, opening
-a ``.rar`` raises a clear error rather than the library's own exception, which
-is otherwise easy to mistake for a corrupt archive.
-
-The corpora here are RAR5, which rules out the older free ``unrar`` builds --
-whatever backend is installed has to read format 5, not just format 4.
+``rarfile`` shells out to an external binary that must already be on the machine.
+The corpora here are RAR5, and the backend is not a matter of taste: measured
+against a real 200-file archive, the official ``unrar`` read 200/200, ``unar``
+195/200, and ``bsdtar`` 0/200 -- and both free tools fail by *truncating*
+rather than erroring. The Dockerfile installs ``unrar`` and asserts at build
+time that it reads a RAR5 probe byte-exact, because otherwise a missing or
+substituted package is invisible until a real ``.rar`` arrives in production.
+If no backend is found, opening a ``.rar`` raises a clear error rather than the
+library's own exception, which is easy to mistake for a corrupt archive.
 
 What "processing" means beyond metadata extraction -- chunking, embedding,
 writing into a ``ragDbId`` -- is still undecided; this module only answers
@@ -31,10 +30,11 @@ import csv
 import io
 import logging
 import os
+import shutil
 import zipfile
 from dataclasses import dataclass, field
 from functools import lru_cache
-from pathlib import PurePosixPath
+from pathlib import Path, PurePosixPath
 from typing import TYPE_CHECKING, Protocol
 from urllib.parse import urlparse
 
@@ -44,25 +44,39 @@ import pdfplumber
 import rarfile
 import tiktoken
 
-# Which binary reads .rar. Deployment is Linux, where the Dockerfile installs
-# `unar` and `bsdtar` and rarfile finds one of them on PATH by itself -- leaving
-# this unset is the normal case and the one production runs in.
-#
-# The override exists for development machines where the tool is present but
-# not on PATH under a name rarfile probes for: on Windows, WinRAR ships
-# UnRAR.exe under Program Files and nothing else is installed, so RAG_UNRAR_TOOL
-# points at it. Setting it *replaces* rarfile's first choice rather than adding
-# to the chain, so an override naming a missing file still falls through to
-# unar/7z/bsdtar rather than failing outright.
-if os.environ.get("RAG_UNRAR_TOOL"):
-    rarfile.UNRAR_TOOL = os.environ["RAG_UNRAR_TOOL"]
-
 if TYPE_CHECKING:
     # Only needed for the type hint below -- importing it for real would make
     # app.jobs.job and app.ingestion.documents import each other.
     from app.jobs.job import Job
 
 logger = logging.getLogger(__name__)
+
+# Which binary reads .rar. Deployment is Linux, where the Dockerfile installs
+# the official `unrar` and rarfile finds it on PATH by itself -- leaving this
+# unset is the normal case and the one production runs in.
+#
+# The override exists for development machines where a capable tool is present
+# but not on PATH under a name rarfile probes for: on Windows, WinRAR ships
+# UnRAR.exe under Program Files and nothing else is installed.
+#
+# **Applied only if it actually exists.** The same .env is read by the developer
+# machine and handed to the container through compose's `env_file`, so a Windows
+# path travels into a Linux image as a matter of course. Setting it there would
+# replace rarfile's first choice with a path that cannot exist, and since the
+# image installs *only* unrar -- unar and bsdtar were measured to truncate RAR5
+# members silently -- there is no second candidate to fall through to. Every
+# .rar would fail at ingestion, in the container only, for a reason visible
+# nowhere near the archive.
+_unrarOverride = os.environ.get("RAG_UNRAR_TOOL", "").strip()
+if _unrarOverride and (shutil.which(_unrarOverride) or Path(_unrarOverride).is_file()):
+    rarfile.UNRAR_TOOL = _unrarOverride
+elif _unrarOverride:
+    logger.warning(
+        "RAG_UNRAR_TOOL points at '%s', which is not on this machine; ignoring it "
+        "and letting rarfile search PATH instead.",
+        _unrarOverride,
+    )
+
 
 DOWNLOAD_TIMEOUT_SECONDS = 60.0
 # A generous ceiling for a personal project, not a production sizing decision.
