@@ -26,6 +26,7 @@ from dataclasses import dataclass
 from pydantic import BaseModel, Field
 
 from app.agent.llmManager import reviewerModel
+from app.promptConfig import reviewCriteria
 
 logger = logging.getLogger(__name__)
 
@@ -34,11 +35,7 @@ logger = logging.getLogger(__name__)
 # "the documents do not cover this" pays for a retry that cannot improve it.
 REVIEW_THRESHOLD = float(os.environ.get("RAG_REVIEW_THRESHOLD", 0.7))
 
-# Interpolated rather than written into the text: the threshold is
-# configurable, and a prompt naming a different number from the one the code
-# compares against would have the reviewer withholding suggestions on exactly
-# the answers that are about to be retried.
-REVIEWER_SYSTEM_PROMPT = (
+REVIEW_RUBRIC = (
     "You grade a draft answer against the question it was written for. Score "
     "0.0 to 1.0 on whether it actually answers the question: is it responsive, "
     "specific, and self-consistent?\n\n"
@@ -46,11 +43,47 @@ REVIEWER_SYSTEM_PROMPT = (
     "honestly states the available material does not cover the question is a "
     "GOOD answer -- score it high. Reserve low scores for answers that are "
     "evasive, off-topic, self-contradictory, padded without substance, or that "
-    "leave an obviously answerable part of the question untouched.\n\n"
+    "leave an obviously answerable part of the question untouched."
+)
+
+# Interpolated rather than written into the text: the threshold is
+# configurable, and a prompt naming a different number from the one the code
+# compares against would have the reviewer withholding suggestions on exactly
+# the answers that are about to be retried.
+SUGGESTION_INSTRUCTION = (
     f"When the score is below {REVIEW_THRESHOLD}, put one concrete instruction "
     "in `suggestion` saying what a better attempt should do differently. "
     "Otherwise leave `suggestion` empty."
 )
+
+
+def reviewerSystemPrompt() -> str:
+    """The rubric, plus whatever the active persona adds to it.
+
+    Built per call rather than frozen at import, for the same reason the agent's
+    own prompt is: the persona is configuration and a restart should not be
+    needed to change it.
+
+    The persona's criteria go *between* the rubric and the suggestion
+    instruction, not after it. Appended at the end they would sit below "put one
+    instruction in `suggestion`", which reads as a qualifier on the output format
+    rather than as something to grade on.
+
+    Why a persona gets a say here at all: without it the reviewer pulls against
+    the agent. It grades "does this answer the question", so a flat factual dump
+    that ignores everything a sales persona was told to do scores 1.0, and the
+    persona has no feedback loop. What a persona must NOT do is outrank honesty
+    -- see the note at the bottom of config/prompts.toml.
+    """
+    criteria = reviewCriteria()
+    if not criteria:
+        return f"{REVIEW_RUBRIC}\n\n{SUGGESTION_INSTRUCTION}"
+
+    return (
+        f"{REVIEW_RUBRIC}\n\n"
+        f"Additionally, for this deployment:\n{criteria}\n\n"
+        f"{SUGGESTION_INSTRUCTION}"
+    )
 
 
 class Review(BaseModel):
@@ -100,7 +133,7 @@ async def review(question: str, answer: str, model=None) -> Review | None:
         judge = (model or reviewerModel()).with_structured_output(Review)
         verdict = await judge.ainvoke(
             [
-                {"role": "system", "content": REVIEWER_SYSTEM_PROMPT},
+                {"role": "system", "content": reviewerSystemPrompt()},
                 {
                     "role": "user",
                     "content": f"Question:\n{question}\n\nDraft answer:\n{answer}",

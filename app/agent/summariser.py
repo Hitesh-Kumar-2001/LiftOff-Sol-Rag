@@ -2,7 +2,7 @@
 
 Two halves of one problem, which is why they share a module.
 
-**Rendering.** A ``ChatWindow`` is storage: a summary, a list of retrievals, a
+**Rendering.** A ``ConversationWindow`` is storage: a summary, a list of retrievals, a
 list of turns. ``renderContext`` and ``renderHistory`` turn it into the two
 things a model actually takes -- a system prompt and a message list.
 
@@ -18,7 +18,7 @@ the same vector search twice.
 conversation whose prompt gets longer every turn costs more every turn and
 eventually stops fitting at all. Past a budget, everything except the last few
 exchanges is folded into one paragraph of prose and the documents behind it are
-never read again. See ``app.stores.chatStore`` for the watermarks that record
+never read again. See ``app.stores.conversationStore`` for the watermarks that record
 how far the fold reached.
 
 **The recent turns are kept verbatim.** Summarising the whole conversation
@@ -39,7 +39,7 @@ import logging
 import os
 
 from app.agent.llmManager import summariserModel
-from app.stores.chatStore import ChatWindow, ContextEntry
+from app.stores.conversationStore import ConversationWindow, ContextEntry
 
 logger = logging.getLogger(__name__)
 
@@ -75,7 +75,7 @@ SUMMARISER_SYSTEM_PROMPT = (
 )
 
 
-def approximateTokens(window: ChatWindow) -> int:
+def approximateTokens(window: ConversationWindow) -> int:
     """Roughly what this window will cost to send. See CHARS_PER_TOKEN."""
     characters = len(window.contextSummary)
     characters += sum(len(message.content) for message in window.messages)
@@ -84,7 +84,7 @@ def approximateTokens(window: ChatWindow) -> int:
     return characters // CHARS_PER_TOKEN
 
 
-def needsSummary(window: ChatWindow) -> bool:
+def needsSummary(window: ConversationWindow) -> bool:
     """Whether this window is over budget and worth folding down.
 
     The second condition matters: a single enormous exchange is over budget and
@@ -97,7 +97,7 @@ def needsSummary(window: ChatWindow) -> bool:
     return window.turnCount - window.summarisedThroughTurn > KEEP_RECENT_TURNS
 
 
-def _foldPoint(window: ChatWindow) -> tuple[int, int]:
+def _foldPoint(window: ConversationWindow) -> tuple[int, int]:
     """The turn and context watermarks a fold of this window would reach.
 
     Everything strictly below them is summarised away; everything at or above
@@ -113,7 +113,7 @@ def _foldPoint(window: ChatWindow) -> tuple[int, int]:
     return throughTurn, throughContext
 
 
-def renderContext(window: ChatWindow) -> str:
+def renderContext(window: ConversationWindow) -> str:
     """The retrieval block for the system prompt, or "" when there is none.
 
     Ends with an instruction, not just material. Passages sitting in a prompt
@@ -144,11 +144,11 @@ def renderContext(window: ChatWindow) -> str:
     )
 
 
-def renderHistory(window: ChatWindow) -> list[dict[str, str]]:
+def renderHistory(window: ConversationWindow) -> list[dict[str, str]]:
     """The stored turns as messages, oldest first.
 
     Only ``role`` and ``content``: the review score and the retried flag are
-    recorded for whoever reads the chat later, and telling a model that its own
+    recorded for whoever reads the conversation later, and telling a model that its own
     earlier answer was graded 0.4 invites it to apologise for it instead of
     answering the question in front of it.
     """
@@ -159,7 +159,7 @@ def renderHistory(window: ChatWindow) -> list[dict[str, str]]:
     ]
 
 
-def trimToBudget(window: ChatWindow) -> ChatWindow:
+def trimToBudget(window: ConversationWindow) -> ConversationWindow:
     """Drop the oldest retrievals until the window fits. Storage is untouched.
 
     The fallback for a window that is over budget and could not be summarised,
@@ -176,15 +176,15 @@ def trimToBudget(window: ChatWindow) -> ChatWindow:
 
     if dropped:
         logger.warning(
-            "Chat '%s' was over budget and could not be summarised; %d retrieval(s) "
+            "Conversation '%s' was over budget and could not be summarised; %d retrieval(s) "
             "were left out of this turn's prompt. They are still stored.",
-            window.chatId,
+            window.conversationId,
             dropped,
         )
     return trimmed
 
 
-def _foldedMaterial(window: ChatWindow, throughTurn: int) -> str:
+def _foldedMaterial(window: ConversationWindow, throughTurn: int) -> str:
     """What the summariser is asked to compress: prior summary, turns, passages."""
     parts: list[str] = []
     if window.contextSummary:
@@ -211,7 +211,7 @@ def _foldedMaterial(window: ChatWindow, throughTurn: int) -> str:
 
 
 async def summariseConversation(
-    window: ChatWindow, model=None
+    window: ConversationWindow, model=None
 ) -> tuple[str, int, int] | None:
     """Fold this window down. Returns (summary, throughTurn, throughContext).
 
@@ -235,7 +235,10 @@ async def summariseConversation(
         # Not fatal. The conversation is still answerable, it just costs this
         # turn more tokens than it should have -- and the caller falls back to
         # trimToBudget so "more" cannot become "too many".
-        logger.exception("Could not summarise chat '%s'; answering unsummarised.", window.chatId)
+        logger.exception(
+            "Could not summarise conversation '%s'; answering unsummarised.",
+            window.conversationId,
+        )
         return None
 
     content = getattr(response, "content", response)
@@ -248,13 +251,17 @@ async def summariseConversation(
         )
     summary = str(content or "").strip()[:SUMMARY_MAX_CHARS]
     if not summary:
-        logger.warning("The summariser returned nothing for chat '%s'.", window.chatId)
+        logger.warning(
+            "The summariser returned nothing for conversation '%s'.", window.conversationId
+        )
         return None
 
     return summary, throughTurn, throughContext
 
 
-def applySummary(window: ChatWindow, summary: str, throughTurn: int, throughContext: int) -> ChatWindow:
+def applySummary(
+    window: ConversationWindow, summary: str, throughTurn: int, throughContext: int
+) -> ConversationWindow:
     """The window as it looks once a summary has been stored.
 
     Kept beside the store's own version of this so the caller can answer from a
@@ -275,7 +282,8 @@ def contextFromSearches(searches: list[dict]) -> list[ContextEntry]:
 
     Indices are placeholders: the store assigns the real ones inside the
     transaction that appends them, because only it knows how many entries the
-    chat already holds. See ``app.stores.chatStore.FirestoreChatStore._appendTurn``.
+    conversation already holds. See
+    ``app.stores.conversationStore.FirestoreConversationStore._appendTurn``.
 
     Searches that returned nothing are kept, not filtered. "The documents do
     not cover this" is a real finding and the expensive one to rediscover --

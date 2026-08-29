@@ -1,0 +1,78 @@
+# Which model does which job. Four roles, and ALL FOUR are required -- the
+# service refuses to start with any of them missing. Each takes exactly two
+# keys, and each section name may appear only once in this file.
+#
+#   provider  one of: openai, anthropic, groq, gemini
+#   model     a model name that provider actually serves
+#
+# The four sections are immediately below. The rationale is at the bottom, so
+# that the thing you came here to edit is the first thing you see -- a header
+# long enough to push [agent] off the screen is a header that gets a second
+# [agent] appended underneath it, which TOML rejects and which takes all four
+# roles down with it.
+
+# Answers the question, and decides when to search the project's documents.
+# The most expensive call the service makes, and the one whose quality is the
+# product.
+[agent]
+provider = "openai"
+model = "gpt-5.6-luna"
+
+# Grades the agent's draft 0.0-1.0 and suggests one improvement. Runs once per
+# question. Grading is easier than answering, so a smaller model here is a
+# reasonable trade -- gpt-5.4-mini rather than a second full-price call.
+[reviewer]
+provider = "openai"
+model = "gpt-5.6-luna"
+
+# Folds a long conversation down to a paragraph once it outgrows
+# RAG_CONTEXT_SUMMARY_TOKENS. On the critical path of a question that is
+# already long, so latency here is latency the user feels; the cheapest thing
+# this service asks a model to do, and the one most worth pointing at a small
+# fast model.
+[summariser]
+provider = "openai"
+model = "gpt-5.6-luna"
+
+# Picks semantic chunk boundaries during ingestion (ChunkingStrategy.AI): one
+# call per blank-line section, RAG_AI_CHUNK_CONCURRENCY at a time. This is by
+# far the highest *call volume* of the four -- a million-token corpus is
+# hundreds of calls in a few minutes -- so it is the role where a per-day
+# request quota bites first, and the one to check when ingestion of a large
+# document fails part way through.
+[chunker]
+provider = "openai"
+model = "gpt-5.6-luna"
+
+
+# ---------------------------------------------------------------------------
+# Why it works this way
+#
+# This file is the source of truth for every model this service calls --
+# nothing in the code names one any more, so repointing the agent is an edit
+# here rather than a patch.
+#
+# Both keys, always. Naming a provider without a model is refused rather than
+# guessed at: a model name is not portable between vendors, so "gpt-5.6-luna"
+# means nothing to Anthropic and the failure would arrive as a 404 from the
+# vendor, three layers below the mistake. There is no default model either --
+# a default would be four vendors' current model names living in code and going
+# stale the first time any of them ships a new one, which is exactly how
+# gemini-2.0-flash came to be pinned in the chunker until Google retired it.
+#
+# The API key for whichever provider a role names comes from the environment
+# and never from here: this file is committed, and keys are not. See
+# app/modelConfig.py for how a role is resolved and app/agent/llmManager.py for
+# the client each provider is built with.
+#
+# Overriding one role for a single deployment, without editing this file:
+#
+#   RAG_AGENT_PROVIDER + RAG_AGENT_MODEL
+#   RAG_REVIEWER_PROVIDER + RAG_REVIEWER_MODEL
+#   RAG_SUMMARISER_PROVIDER + RAG_SUMMARISER_MODEL
+#   RAG_CHUNKER_PROVIDER + RAG_CHUNKER_MODEL
+#
+# An override must set both halves of a pair, for the same reason this file
+# must. Environment wins over this file where it is set, which is what lets a
+# container be pointed somewhere else without a rebuild; leave those variables
+# unset -- as .env now does -- and this file is what is read.

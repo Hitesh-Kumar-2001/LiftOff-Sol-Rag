@@ -147,7 +147,7 @@ def getJobManager():
     require a working configuration -- so every consumer, including anything
     that only wanted the exception types, had to set the environment first and
     in the right order. Lazy and cached matches ``getProjectStore``,
-    ``getChatStore`` and ``getChunkStore``, and ``app.main.checkConfiguration``
+    ``getConversationStore`` and ``getChunkStore``, and ``app.main.checkConfiguration``
     calls it during startup so a missing REDIS_URL still fails the deploy
     rather than the first upload.
     """

@@ -1,7 +1,7 @@
 """The suite runs against real Firestore. This is what keeps that safe.
 
 There are no in-process stores any more: ``buildProjectStore`` and
-``buildChatStore`` return Firestore or raise. That is a deliberate trade. A dict
+``buildConversationStore`` return Firestore or raise. That is a deliberate trade. A dict
 with a lock agrees with itself by construction, so the two things most worth
 testing -- the transaction in ``resolveOrCreate`` and the one in ``appendTurn``,
 both of which exist solely to survive concurrency -- were never actually
@@ -44,7 +44,7 @@ def pytest_configure(config) -> None:
         raise pytest.UsageError(
             "GCP_PROJECT_ID is not set. The suite runs against real Firestore -- "
             "there are no in-process stores. Set GCP_PROJECT_ID and "
-            "GOOGLE_APPLICATION_CREDENTIALS in .env (see docs/chatSchema.md)."
+            "GOOGLE_APPLICATION_CREDENTIALS in .env (see docs/conversationSchema.md)."
         )
 
 
@@ -81,7 +81,7 @@ class FirestoreScratch:
 
     def cleanup(self) -> None:
         from app.infra.firestoreClient import firestoreClient
-        from app.stores.chatStore import COLLECTION as CHATS
+        from app.stores.conversationStore import COLLECTION as CONVERSATIONS
         from app.stores.projectStore import COLLECTION as PROJECTS
 
         db = firestoreClient()
@@ -95,16 +95,20 @@ class FirestoreScratch:
                 pass
 
             try:
-                chats = db.collection(CHATS).document(projectId).collection("chats")
-                for chat in chats.stream():
+                conversations = (
+                    db.collection(CONVERSATIONS)
+                    .document(projectId)
+                    .collection("conversations")
+                )
+                for conversation in conversations.stream():
                     # Firestore does not delete subcollections with their
-                    # parent; a chat deleted without these leaves orphaned
+                    # parent; a conversation deleted without these leaves orphaned
                     # messages that nothing will ever read or remove.
                     for name in ("messages", "context"):
-                        for document in chat.reference.collection(name).stream():
+                        for document in conversation.reference.collection(name).stream():
                             document.reference.delete()
-                    chat.reference.delete()
-                db.collection(CHATS).document(projectId).delete()
+                    conversation.reference.delete()
+                db.collection(CONVERSATIONS).document(projectId).delete()
             except Exception:
                 pass
 
@@ -164,14 +168,14 @@ def projects(scratch):
 
 
 @pytest.fixture
-def chats(scratch):
-    """A real ``FirestoreChatStore``, with no Redis in front of it.
+def conversations(scratch):
+    """A real ``FirestoreConversationStore``, with no Redis in front of it.
 
     Deliberately uncached: a cache hit would answer reads without Firestore,
     and then a test asserting what was stored would be asserting what was
-    remembered. ``tests/testChatStore.py`` exercises the cache explicitly, with
+    remembered. ``tests/testConversationStore.py`` exercises the cache explicitly, with
     a fake Redis, where that is the point.
     """
-    from app.stores.chatStore import FirestoreChatStore
+    from app.stores.conversationStore import FirestoreConversationStore
 
-    return FirestoreChatStore(redis=None)
+    return FirestoreConversationStore(redis=None)

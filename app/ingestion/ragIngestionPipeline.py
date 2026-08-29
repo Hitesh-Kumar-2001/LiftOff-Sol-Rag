@@ -43,17 +43,16 @@ from urllib.parse import urlparse
 
 import httpx
 import tiktoken
-from google import genai
-from google.genai import types
+from pydantic import BaseModel, Field
 
 logger = logging.getLogger(__name__)
 
-ENV_GEMINI_API_KEY = "GEMINI_API_KEY"
-# Flash-lite: the cheapest tier, and picking chunk boundaries does not need
-# more. Pinned rather than `gemini-flash-latest` so a model retirement or a
-# behaviour change is something we opt into -- gemini-2.0-flash was the
-# default here until Google retired it out from under this code.
-GEMINI_MODEL = os.environ.get("RAG_GEMINI_MODEL", "gemini-3.5-flash-lite")
+# Which model does the AI chunking is not decided here: it is the [chunker]
+# role in config/models.toml, resolved through app.agent.llmManager like every
+# other model this service calls. This module used to pin
+# `gemini-3.5-flash-lite` and reach for Gemini's SDK directly -- the one AI call
+# that could not be moved without a code change, and the one that stopped a
+# large ingestion dead when that vendor's per-day quota ran out.
 
 DOWNLOAD_TIMEOUT_SECONDS = 60.0
 TOKEN_ENCODING_NAME = "cl100k_base"
@@ -89,7 +88,7 @@ class IngestionError(Exception):
 class ChunkingStrategy(Enum):
     RAW = auto()  # store the whole document as one chunk, no splitting
     NON_AI = auto()  # fixed-size token windows with overlap
-    AI = auto()  # Gemini Flash decides chunk boundaries
+    AI = auto()  # the configured chunker model decides chunk boundaries
 
 
 @dataclass
@@ -268,21 +267,74 @@ def enforceEmbedLimit(chunks: list[str]) -> list[str]:
     return limited
 
 
+class ChunkList(BaseModel):
+    """The shape the chunker is required to answer in.
+
+    A wrapper around a bare list because a JSON schema needs an object at its
+    root -- no provider will accept a top-level array as a structured-output
+    schema, so the list is given a name and lives one level down.
+    """
+
+    chunks: list[str] = Field(
+        description="The section split into self-contained chunks, in document order."
+    )
+
+
 @lru_cache(maxsize=1)
-def geminiClient() -> genai.Client:
-    apiKey = os.environ.get(ENV_GEMINI_API_KEY)
-    if not apiKey:
-        raise IngestionError(f"{ENV_GEMINI_API_KEY} is not set.")
-    return genai.Client(api_key=apiKey)
+def chunkerRunnable():
+    """The configured chunker model, bound to the ChunkList schema.
+
+    Built once. ``chunkerModel`` is itself cached per (provider, model) because
+    each client owns a connection pool, and ``with_structured_output`` is a thin
+    wrapper -- but this is called once per *section*, of which a large corpus
+    has thousands, so the wrapper is worth not rebuilding either.
+
+    Structured output rather than "please answer in JSON" in the prompt: told
+    only in words, a model asked to chunk real prose returns JSON containing
+    invalid escapes -- a backslash from the source text passed through verbatim
+    -- and the document is then chunked by the fallback path for reasons nobody
+    can see. Asking the provider to constrain the output is what made that stop
+    happening, and it survives the move between vendors because every provider
+    this service supports implements it.
+    """
+    from app.agent.llmManager import chunkerModel
+
+    return chunkerModel().with_structured_output(ChunkList)
+
+
+def chunksFromAnswer(answer) -> list[str]:
+    """The chunk list out of whatever structured output actually returned.
+
+    Three shapes, because ``with_structured_output`` is not uniform across the
+    providers this can be pointed at: the Pydantic object it promises, a plain
+    dict from an integration that skips validation, and a raw string from one
+    that fell back to text. The last is why ``parseAiChunks`` still exists.
+    """
+    if isinstance(answer, ChunkList):
+        chunks = answer.chunks
+    elif isinstance(answer, dict):
+        chunks = answer.get("chunks") or []
+    elif isinstance(answer, str):
+        chunks = parseAiChunks(answer)
+    else:
+        chunks = getattr(answer, "chunks", None) or []
+
+    return [str(chunk).strip() for chunk in chunks if str(chunk).strip()]
 
 
 async def chunkWithAi(
     sections: list[str],
     *,
-    model: str = GEMINI_MODEL,
+    chunker=None,
     maxTokens: int = DEFAULT_CHUNK_TOKENS,
 ) -> list[str]:
-    """Ask Gemini Flash to pick semantic chunk boundaries within each section.
+    """Ask the configured model to pick semantic chunk boundaries per section.
+
+    Which model that is comes from ``[chunker]`` in ``config/models.toml`` --
+    this used to call Gemini through its own SDK, with its own key and its own
+    pinned model name, which made it the one AI call in the service that could
+    not be moved without editing this file. It is now the same provider layer
+    the agent, the reviewer and the summariser go through.
 
     One call per section, run several at a time. Sections are independent --
     each is chunked on its own -- so waiting for one before starting the next
@@ -293,42 +345,55 @@ async def chunkWithAi(
 
     ``gather`` preserves order, so chunks come back in document order rather
     than completion order.
+
+    ``chunker`` is injectable for tests, which is the only reason it is a
+    parameter; nothing in the application passes it.
     """
-    client = geminiClient()
+    runnable = chunker or chunkerRunnable()
     semaphore = asyncio.Semaphore(AI_CHUNK_CONCURRENCY)
 
     async def chunkSection(section: str) -> list[str]:
         prompt = AI_CHUNK_PROMPT.format(maxTokens=maxTokens, text=section)
         async with semaphore:
             try:
-                response = await client.aio.models.generate_content(
-                    model=model,
-                    contents=prompt,
-                    # Ask the API to constrain the output rather than trusting
-                    # the prompt to. Told only in words, the model answers
-                    # real prose with JSON containing invalid escapes -- a
-                    # backslash from the source text passed through verbatim.
-                    config=types.GenerateContentConfig(
-                        response_mime_type="application/json",
-                        response_schema=list[str],
-                    ),
-                )
+                answer = await runnable.ainvoke([{"role": "user", "content": prompt}])
             except Exception as exc:
-                raise IngestionError(f"Gemini chunking failed: {exc}") from exc
+                # Deliberately fatal to the whole document rather than falling
+                # back per section. A bad key, an exhausted quota or a retired
+                # model fails every section identically, and quietly chunking
+                # the entire corpus by the non-AI path would store a database
+                # that looks successful and is worse than the one that was
+                # asked for. The job goes FAILED and resubmitting is the retry
+                # -- see app.jobs.job.runJob.
+                raise IngestionError(f"AI chunking failed: {exc}") from exc
 
         try:
-            return parseAiChunks(response.text)
+            chunks = chunksFromAnswer(answer)
         except IngestionError as exc:
             # One unusable answer should not lose a whole document. The
             # non-AI split is a worse chunk boundary, not a wrong one.
             logger.warning("Falling back to non-AI chunking for one section: %s", exc)
             return chunkWithoutAi([section], chunkTokens=maxTokens)
 
+        if not chunks:
+            logger.warning(
+                "The chunker returned nothing for one section; falling back to "
+                "non-AI chunking for it."
+            )
+            return chunkWithoutAi([section], chunkTokens=maxTokens)
+        return chunks
+
     perSection = await asyncio.gather(*(chunkSection(s) for s in sections))
     return [chunk for section in perSection for chunk in section]
 
 
 def parseAiChunks(raw: str | None) -> list[str]:
+    """A JSON array of strings out of a plain-text answer.
+
+    Only reached when structured output degraded to text. Kept because that is
+    exactly the case where the answer is least likely to be clean -- a model
+    answering in prose wraps its JSON in markdown fences.
+    """
     text = (raw or "").strip()
     if text.startswith("```"):
         text = text.strip("`")
@@ -340,10 +405,10 @@ def parseAiChunks(raw: str | None) -> list[str]:
     try:
         parsed = json.loads(text)
     except json.JSONDecodeError as exc:
-        raise IngestionError(f"Gemini returned unparsable chunks: {exc}") from exc
+        raise IngestionError(f"The chunker returned unparsable chunks: {exc}") from exc
 
     if not isinstance(parsed, list) or not all(isinstance(item, str) for item in parsed):
-        raise IngestionError("Gemini did not return a JSON array of strings.")
+        raise IngestionError("The chunker did not return a JSON array of strings.")
 
     return [item.strip() for item in parsed if item.strip()]
 

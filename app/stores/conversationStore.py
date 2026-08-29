@@ -1,15 +1,15 @@
 """One conversation: the prompt it answers with, what it has already retrieved,
 and the turns it has taken.
 
-A chat holds three things, and they are three different kinds of data:
+A conversation holds three things, and they are three different kinds of data:
 
-* **``systemPrompt``** -- snapshotted onto the chat when it is created, not
+* **``systemPrompt``** -- snapshotted onto the conversation when it is created, not
   re-resolved per turn. A project's prompt is editable (see
   ``app.agent.promptStore``), and a conversation whose instructions change
   underneath it half way through stops being one conversation: the model is
   asked to keep faith with earlier answers it would no longer have given. New
-  chats pick up the new prompt; running ones finish under the one they started.
-* **``context``** -- the passages this chat has already retrieved, one entry per
+  conversations pick up the new prompt; running ones finish under the one they started.
+* **``context``** -- the passages this conversation has already retrieved, one entry per
   search the agent ran. This is the expensive half. Re-deriving it means paying
   for the same vector searches on every follow-up, so it is stored and replayed
   into the prompt rather than fetched again. See
@@ -24,13 +24,13 @@ Layout
 ------
 ::
 
-    ragChats/{projectId}                       one project's chats
-      chats/{chatId}                           the chat: prompt, summary, counters
-        messages/{turnIndex zero-padded}       one turn each
-        context/{entryIndex zero-padded}       one retrieval each
+    ragConversations/{projectId}              one project's conversations
+      conversations/{conversationId}          prompt, summary, counters
+        messages/{turnIndex zero-padded}      one turn each
+        context/{entryIndex zero-padded}      one retrieval each
 
-**Subcollections, not fields on the chat document.** A Firestore document is
-capped at 1 MiB and every write rewrites the whole thing, so a ``chatHistory``
+**Subcollections, not fields on the conversation document.** A Firestore document is
+capped at 1 MiB and every write rewrites the whole thing, so a ``conversationHistory``
 array would make each turn cost the length of the conversation so far and would
 hard-stop a few hundred turns in. Retrieved passages are worse again -- six
 chunks a search, several searches a turn. One document per item makes appending
@@ -64,47 +64,47 @@ from typing import Protocol
 
 logger = logging.getLogger(__name__)
 
-COLLECTION = os.environ.get("FIRESTORE_CHATS_COLLECTION", "ragChats")
+COLLECTION = os.environ.get("FIRESTORE_CONVERSATIONS_COLLECTION", "ragConversations")
 
-CACHE_PREFIX = os.environ.get("RAG_CHAT_CACHE_PREFIX", "ragChat:")
+CACHE_PREFIX = os.environ.get("RAG_CONVERSATION_CACHE_PREFIX", "ragConversation:")
 
 # How long an assembled window is served before Firestore is asked again. A
 # generous value is safe here in a way it is not for prompts: every append
-# rewrites the entry, so this only ever covers a chat nobody has spoken in, and
+# rewrites the entry, so this only ever covers a conversation nobody has spoken in, and
 # a miss costs reads rather than correctness.
-CACHE_TTL_SECONDS = int(os.environ.get("RAG_CHAT_CACHE_TTL_SECONDS", 3600))
+CACHE_TTL_SECONDS = int(os.environ.get("RAG_CONVERSATION_CACHE_TTL_SECONDS", 3600))
 
-# How long a chat survives its last turn. Written onto every document as
+# How long a conversation survives its last turn. Written onto every document as
 # ``expiresAt`` for a Firestore TTL policy to act on -- **the field alone
 # deletes nothing**; a TTL policy has to be created on each of the three
-# collection groups (chats, messages, context) for it to mean anything. Storing
+# collection groups (conversations, messages, context) for it to mean anything. Storing
 # it regardless means turning expiry on later is a console change rather than a
 # backfill over every conversation ever held. 90 days.
-CHAT_TTL_SECONDS = int(os.environ.get("RAG_CHAT_TTL_SECONDS", 90 * 24 * 3600))
+CONVERSATION_TTL_SECONDS = int(os.environ.get("RAG_CONVERSATION_TTL_SECONDS", 90 * 24 * 3600))
 
 # Caps, so one enormous turn cannot walk a document up towards the 1 MiB limit
-# and start failing every subsequent write to that chat. Generous enough that
+# and start failing every subsequent write to that conversation. Generous enough that
 # no real answer is touched.
-MAX_MESSAGE_CHARS = int(os.environ.get("RAG_CHAT_MAX_MESSAGE_CHARS", 20000))
-MAX_PASSAGE_CHARS = int(os.environ.get("RAG_CHAT_MAX_PASSAGE_CHARS", 4000))
+MAX_MESSAGE_CHARS = int(os.environ.get("RAG_CONVERSATION_MAX_MESSAGE_CHARS", 20000))
+MAX_PASSAGE_CHARS = int(os.environ.get("RAG_CONVERSATION_MAX_PASSAGE_CHARS", 4000))
 
-# What a chat is listed under, and how much of the last answer is kept beside
-# it, so a chat list is one read per chat rather than one subcollection scan.
+# What a conversation is listed under, and how much of the last answer is kept beside
+# it, so a conversation list is one read per conversation rather than one subcollection scan.
 TITLE_CHARS = 80
 
 
-class ChatStoreError(Exception):
-    """The chat store could not be reached.
+class ConversationStoreError(Exception):
+    """The conversation store could not be reached.
 
-    Distinct from "no such chat", which is a ``None`` return. The caller turns
+    Distinct from "no such conversation", which is a ``None`` return. The caller turns
     the first into a degraded answer and the second into a 404, and it has to
-    be able to tell them apart -- answering a real chat as though it were empty
+    be able to tell them apart -- answering a real conversation as though it were empty
     silently drops a conversation the caller can see they were having.
     """
 
 
-def newChatId() -> str:
-    """A fresh chat id. Random, and not derived from anything.
+def newConversationId() -> str:
+    """A fresh conversation id. Random, and not derived from anything.
 
     Same reasoning as ``app.stores.projectStore.newRagDbId``: an id computed
     from its contents is an id that can never be changed. Nothing may recompute
@@ -118,7 +118,7 @@ def _now() -> datetime:
 
 
 def _expiry() -> datetime:
-    return _now() + timedelta(seconds=CHAT_TTL_SECONDS)
+    return _now() + timedelta(seconds=CONVERSATION_TTL_SECONDS)
 
 
 def _isoOf(value) -> str:
@@ -140,7 +140,7 @@ def _isoOf(value) -> str:
 
 
 @dataclass(frozen=True)
-class ChatMessage:
+class ConversationMessage:
     """One turn. ``reviewScore`` and ``retried`` are the assistant's only."""
 
     turnIndex: int
@@ -172,7 +172,7 @@ class ContextEntry:
 
 
 @dataclass
-class ChatWindow:
+class ConversationWindow:
     """Everything one turn needs, assembled: prompt, summary, and live tail.
 
     ``context`` and ``messages`` hold only what the summary does not already
@@ -182,10 +182,10 @@ class ChatWindow:
 
     ``turnCount`` and ``contextCount`` are the *next* indices, not the number of
     items present here; the window is a tail, the counters describe the whole
-    chat.
+    conversation.
     """
 
-    chatId: str
+    conversationId: str
     projectId: str
     systemPrompt: str
     ragDbId: str | None = None
@@ -195,28 +195,31 @@ class ChatWindow:
     turnCount: int = 0
     contextCount: int = 0
     context: list[ContextEntry] = field(default_factory=list)
-    messages: list[ChatMessage] = field(default_factory=list)
+    messages: list[ConversationMessage] = field(default_factory=list)
 
     def toJson(self) -> str:
         return json.dumps(asdict(self))
 
     @classmethod
-    def fromJson(cls, raw: str) -> "ChatWindow":
+    def fromJson(cls, raw: str) -> "ConversationWindow":
         data = json.loads(raw)
         return cls(
             **{
                 **data,
                 "context": [ContextEntry(**entry) for entry in data.get("context", [])],
-                "messages": [ChatMessage(**message) for message in data.get("messages", [])],
+                "messages": [
+                    ConversationMessage(**message)
+                    for message in data.get("messages", [])
+                ],
             }
         )
 
-    def copy(self) -> "ChatWindow":
+    def copy(self) -> "ConversationWindow":
         """A detached copy, so a caller editing a window cannot edit the store."""
-        return ChatWindow.fromJson(self.toJson())
+        return ConversationWindow.fromJson(self.toJson())
 
 
-def _messageDocument(message: ChatMessage, now: datetime) -> dict:
+def _messageDocument(message: ConversationMessage, now: datetime) -> dict:
     return {
         "turnIndex": message.turnIndex,
         "role": message.role,
@@ -240,7 +243,7 @@ def _contextDocument(entry: ContextEntry, now: datetime) -> dict:
     }
 
 
-class ChatStore(Protocol):
+class ConversationStore(Protocol):
     """A conversation's storage, however it is backed.
 
     Four operations, which is the whole surface: start one, read the window a
@@ -248,30 +251,30 @@ class ChatStore(Protocol):
     a summary.
     """
 
-    async def createChat(
+    async def createConversation(
         self, *, projectId: str, systemPrompt: str, ragDbId: str | None, title: str = ""
-    ) -> ChatWindow:
-        """Bring a new chat into existence and return its empty window."""
+    ) -> ConversationWindow:
+        """Bring a new conversation into existence and return its empty window."""
         ...
 
-    async def loadWindow(self, projectId: str, chatId: str) -> ChatWindow | None:
-        """The window for an existing chat, or None if there is no such chat.
+    async def loadWindow(self, projectId: str, conversationId: str) -> ConversationWindow | None:
+        """The window for an existing conversation, or None if there is no such conversation.
 
-        Raises ``ChatStoreError`` when the store could not be reached -- a
-        different answer from "no such chat", and it must stay different.
+        Raises ``ConversationStoreError`` when the store could not be reached -- a
+        different answer from "no such conversation", and it must stay different.
         """
         ...
 
     async def appendTurn(
         self,
         *,
-        window: ChatWindow,
+        window: ConversationWindow,
         question: str,
         answer: str,
         context: list[ContextEntry],
         reviewScore: float | None = None,
         retried: bool = False,
-    ) -> ChatWindow:
+    ) -> ConversationWindow:
         """Record one completed exchange, and return the window after it."""
         ...
 
@@ -279,7 +282,7 @@ class ChatStore(Protocol):
         self,
         *,
         projectId: str,
-        chatId: str,
+        conversationId: str,
         summary: str,
         throughTurn: int,
         throughContext: int,
@@ -288,8 +291,8 @@ class ChatStore(Protocol):
         ...
 
 
-class FirestoreChatStore:
-    """Chats in Firestore, with the assembled window cached in Redis.
+class FirestoreConversationStore:
+    """Conversations in Firestore, with the assembled window cached in Redis.
 
     Redis is optional and its failures are non-events: a miss costs reads, and
     a write that never lands costs the next turn the same reads. Firestore is
@@ -310,54 +313,54 @@ class FirestoreChatStore:
 
     # --- references -------------------------------------------------------
 
-    def _chatRef(self, projectId: str, chatId: str):
+    def _conversationRef(self, projectId: str, conversationId: str):
         return (
             self._db.collection(COLLECTION)
             .document(projectId)
-            .collection("chats")
-            .document(chatId)
+            .collection("conversations")
+            .document(conversationId)
         )
 
-    def cacheKey(self, projectId: str, chatId: str) -> str:
-        return f"{CACHE_PREFIX}{projectId}:{chatId}"
+    def cacheKey(self, projectId: str, conversationId: str) -> str:
+        return f"{CACHE_PREFIX}{projectId}:{conversationId}"
 
     # --- creating ---------------------------------------------------------
 
-    async def createChat(
+    async def createConversation(
         self, *, projectId: str, systemPrompt: str, ragDbId: str | None, title: str = ""
-    ) -> ChatWindow:
+    ) -> ConversationWindow:
         return await asyncio.to_thread(
-            self._createChat, projectId, systemPrompt, ragDbId, title
+            self._createConversation, projectId, systemPrompt, ragDbId, title
         )
 
-    def _createChat(
+    def _createConversation(
         self, projectId: str, systemPrompt: str, ragDbId: str | None, title: str
-    ) -> ChatWindow:
-        window = ChatWindow(
-            chatId=newChatId(),
+    ) -> ConversationWindow:
+        window = ConversationWindow(
+            conversationId=newConversationId(),
             projectId=projectId,
             systemPrompt=systemPrompt,
             ragDbId=ragDbId,
         )
         now = _now()
 
-        # The parent document exists only so a project's chats can be found by
+        # The parent document exists only so a project's conversations can be found by
         # listing rather than by collection-group query. Firestore is perfectly
         # happy to hold a subcollection under a document that was never
-        # written, and such a chat is reachable but invisible in the console.
+        # written, and such a conversation is reachable but invisible in the console.
         self._db.collection(COLLECTION).document(projectId).set(
             {"projectId": projectId, "updatedAt": now}, merge=True
         )
 
-        self._chatRef(projectId, window.chatId).set(
+        self._conversationRef(projectId, window.conversationId).set(
             {
-                "chatId": window.chatId,
+                "conversationId": window.conversationId,
                 "projectId": projectId,
                 # Snapshotted deliberately -- see the module docstring.
                 "systemPrompt": systemPrompt,
                 # Audit only. Retrieval resolves the ragDbId from the projectId
                 # at the route on every request, and nothing may resolve it
-                # from here: a chat would otherwise outlive a rebuilt database
+                # from here: a conversation would otherwise outlive a rebuilt database
                 # and keep searching a namespace the project no longer uses.
                 "ragDbId": ragDbId,
                 "title": title[:TITLE_CHARS],
@@ -377,25 +380,27 @@ class FirestoreChatStore:
 
     # --- reading ----------------------------------------------------------
 
-    async def loadWindow(self, projectId: str, chatId: str) -> ChatWindow | None:
-        cached = await self._cacheGet(projectId, chatId)
+    async def loadWindow(self, projectId: str, conversationId: str) -> ConversationWindow | None:
+        cached = await self._cacheGet(projectId, conversationId)
         if cached is not None:
             return cached
 
         try:
-            window = await asyncio.to_thread(self._loadFromStore, projectId, chatId)
+            window = await asyncio.to_thread(self._loadFromStore, projectId, conversationId)
         except Exception as exc:
             # Raised rather than swallowed into an empty window: the caller has
             # to be able to tell "Firestore is down, answer this turn without
-            # its history" from "there is no such chat, 404".
-            raise ChatStoreError(f"Could not read chat '{chatId}'.") from exc
+            # its history" from "there is no such conversation, 404".
+            raise ConversationStoreError(
+                f"Could not read conversation '{conversationId}'."
+            ) from exc
 
         if window is not None:
             await self._cacheSet(window)
         return window
 
-    def _loadFromStore(self, projectId: str, chatId: str) -> ChatWindow | None:
-        """The Firestore half: the chat document, then only the live tail.
+    def _loadFromStore(self, projectId: str, conversationId: str) -> ConversationWindow | None:
+        """The Firestore half: the conversation document, then only the live tail.
 
         Two range queries rather than two collection scans.
         ``summarisedThroughTurn`` and ``summarisedThroughContext`` are what keep
@@ -405,7 +410,7 @@ class FirestoreChatStore:
         """
         from google.cloud.firestore_v1.base_query import FieldFilter
 
-        reference = self._chatRef(projectId, chatId)
+        reference = self._conversationRef(projectId, conversationId)
         snapshot = reference.get()
         if not snapshot.exists:
             return None
@@ -415,7 +420,7 @@ class FirestoreChatStore:
         throughContext = int(data.get("summarisedThroughContext") or 0)
 
         messages = [
-            ChatMessage(
+            ConversationMessage(
                 turnIndex=int(raw.get("turnIndex", 0)),
                 role=raw.get("role", "user"),
                 content=raw.get("content", ""),
@@ -450,8 +455,8 @@ class FirestoreChatStore:
             )
         ]
 
-        return ChatWindow(
-            chatId=chatId,
+        return ConversationWindow(
+            conversationId=conversationId,
             projectId=projectId,
             systemPrompt=data.get("systemPrompt", ""),
             ragDbId=data.get("ragDbId"),
@@ -469,13 +474,13 @@ class FirestoreChatStore:
     async def appendTurn(
         self,
         *,
-        window: ChatWindow,
+        window: ConversationWindow,
         question: str,
         answer: str,
         context: list[ContextEntry],
         reviewScore: float | None = None,
         retried: bool = False,
-    ) -> ChatWindow:
+    ) -> ConversationWindow:
         updated = await asyncio.to_thread(
             self._appendTurn, window, question, answer, context, reviewScore, retried
         )
@@ -484,35 +489,35 @@ class FirestoreChatStore:
 
     def _appendTurn(
         self,
-        window: ChatWindow,
+        window: ConversationWindow,
         question: str,
         answer: str,
         context: list[ContextEntry],
         reviewScore: float | None,
         retried: bool,
-    ) -> ChatWindow:
+    ) -> ConversationWindow:
         """One transaction: both messages, every retrieval, and the counters.
 
-        A transaction and not a batch, because the indices come from the chat
-        document's own counters -- two questions sent into one chat at the same
+        A transaction and not a batch, because the indices come from the conversation
+        document's own counters -- two questions sent into one conversation at the same
         moment would otherwise both read ``turnCount`` as 6, both write
         ``messages/000006``, and one exchange would simply vanish. Reading the
         counter inside the transaction makes the second attempt see the first's
         write and retry against 8.
 
-        Atomic also means a chat is never left showing a question with no
+        Atomic also means a conversation is never left showing a question with no
         answer, or an answer whose retrieved passages did not survive beside it.
         """
         from firebase_admin import firestore
 
-        reference = self._chatRef(window.projectId, window.chatId)
+        reference = self._conversationRef(window.projectId, window.conversationId)
 
         @firestore.transactional
-        def appendInTransaction(transaction) -> ChatWindow:
+        def appendInTransaction(transaction) -> ConversationWindow:
             snapshot = reference.get(transaction=transaction)
             if not snapshot.exists:
-                raise ChatStoreError(
-                    f"No chat '{window.chatId}' in project '{window.projectId}'."
+                raise ConversationStoreError(
+                    f"No conversation '{window.conversationId}' in project '{window.projectId}'."
                 )
 
             data = snapshot.to_dict() or {}
@@ -520,13 +525,13 @@ class FirestoreChatStore:
             entryIndex = int(data.get("contextCount") or 0)
             now = _now()
 
-            userTurn = ChatMessage(
+            userTurn = ConversationMessage(
                 turnIndex=turnIndex,
                 role="user",
                 content=question[:MAX_MESSAGE_CHARS],
                 createdAt=_isoOf(now),
             )
-            assistantTurn = ChatMessage(
+            assistantTurn = ConversationMessage(
                 turnIndex=turnIndex + 1,
                 role="assistant",
                 content=answer[:MAX_MESSAGE_CHARS],
@@ -567,15 +572,15 @@ class FirestoreChatStore:
                     "contextCount": entryIndex + len(context),
                     "updatedAt": now,
                     "expiresAt": _expiry(),
-                    # A chat list wants a line per chat, not a subcollection
-                    # read per chat. Both of these are denormalised for that.
+                    # A conversation list wants a line per conversation, not a subcollection
+                    # read per conversation. Both of these are denormalised for that.
                     "lastMessage": answer[:TITLE_CHARS],
                     **({"title": question[:TITLE_CHARS]} if not data.get("title") else {}),
                 },
             )
 
-            return ChatWindow(
-                chatId=window.chatId,
+            return ConversationWindow(
+                conversationId=window.conversationId,
                 projectId=window.projectId,
                 systemPrompt=data.get("systemPrompt") or window.systemPrompt,
                 ragDbId=data.get("ragDbId", window.ragDbId),
@@ -594,25 +599,30 @@ class FirestoreChatStore:
         self,
         *,
         projectId: str,
-        chatId: str,
+        conversationId: str,
         summary: str,
         throughTurn: int,
         throughContext: int,
     ) -> None:
         await asyncio.to_thread(
-            self._saveSummary, projectId, chatId, summary, throughTurn, throughContext
+            self._saveSummary, projectId, conversationId, summary, throughTurn, throughContext
         )
         # Dropped rather than rewritten. The caller is holding the window it
         # just summarised and is about to append a turn to it, and writing a
         # window here would race that append. The next turn re-reads -- and
         # re-reading is now cheap, which is the entire point of having written
         # the summary.
-        await self._cacheDelete(projectId, chatId)
+        await self._cacheDelete(projectId, conversationId)
 
     def _saveSummary(
-        self, projectId: str, chatId: str, summary: str, throughTurn: int, throughContext: int
+        self,
+        projectId: str,
+        conversationId: str,
+        summary: str,
+        throughTurn: int,
+        throughContext: int,
     ) -> None:
-        self._chatRef(projectId, chatId).update(
+        self._conversationRef(projectId, conversationId).update(
             {
                 "contextSummary": summary,
                 "summarisedThroughTurn": throughTurn,
@@ -627,40 +637,48 @@ class FirestoreChatStore:
     # not in Firestore, so the worst a broken cache can do is make a turn cost
     # the reads it would have cost anyway.
 
-    async def _cacheGet(self, projectId: str, chatId: str) -> ChatWindow | None:
+    async def _cacheGet(self, projectId: str, conversationId: str) -> ConversationWindow | None:
         if self._redis is None:
             return None
         try:
-            raw = await asyncio.to_thread(self._redis.get, self.cacheKey(projectId, chatId))
-            return ChatWindow.fromJson(raw) if raw else None
+            raw = await asyncio.to_thread(self._redis.get, self.cacheKey(projectId, conversationId))
+            return ConversationWindow.fromJson(raw) if raw else None
         except Exception:
-            logger.warning("Chat cache read failed for '%s'.", chatId, exc_info=True)
+            logger.warning(
+                "Conversation cache read failed for '%s'.", conversationId, exc_info=True
+            )
             return None
 
-    async def _cacheSet(self, window: ChatWindow) -> None:
+    async def _cacheSet(self, window: ConversationWindow) -> None:
         if self._redis is None:
             return
         try:
             await asyncio.to_thread(
                 self._redis.set,
-                self.cacheKey(window.projectId, window.chatId),
+                self.cacheKey(window.projectId, window.conversationId),
                 window.toJson(),
                 ex=CACHE_TTL_SECONDS,
             )
         except Exception:
-            logger.warning("Chat cache write failed for '%s'.", window.chatId, exc_info=True)
+            logger.warning(
+                "Conversation cache write failed for '%s'.",
+                window.conversationId,
+                exc_info=True,
+            )
 
-    async def _cacheDelete(self, projectId: str, chatId: str) -> None:
+    async def _cacheDelete(self, projectId: str, conversationId: str) -> None:
         if self._redis is None:
             return
         try:
-            await asyncio.to_thread(self._redis.delete, self.cacheKey(projectId, chatId))
+            await asyncio.to_thread(self._redis.delete, self.cacheKey(projectId, conversationId))
         except Exception:
-            logger.warning("Chat cache drop failed for '%s'.", chatId, exc_info=True)
+            logger.warning(
+                "Conversation cache drop failed for '%s'.", conversationId, exc_info=True
+            )
 
 
-def buildChatStore() -> ChatStore:
-    """The chat store. Firestore, or nothing.
+def buildConversationStore() -> ConversationStore:
+    """The conversation store. Firestore, or nothing.
 
     No in-process fallback, for the same reason as
     ``app.stores.projectStore.buildProjectStore``: a conversation that dies with
@@ -676,7 +694,7 @@ def buildChatStore() -> ChatStore:
     """
     if not os.environ.get("GCP_PROJECT_ID"):
         raise RuntimeError(
-            "GCP_PROJECT_ID is not set, so chat history has nowhere to live. Set it "
+            "GCP_PROJECT_ID is not set, so conversation history has nowhere to live. Set it "
             "(and GOOGLE_APPLICATION_CREDENTIALS outside GCP) -- there is no "
             "in-process substitute, because one would drop every conversation on "
             "restart without anything looking wrong."
@@ -689,16 +707,16 @@ def buildChatStore() -> ChatStore:
         logger.info(
             "No REDIS_URL: every question re-reads its conversation from Firestore."
         )
-    return FirestoreChatStore(redis=redis)
+    return FirestoreConversationStore(redis=redis)
 
 
 @lru_cache(maxsize=1)
-def getChatStore() -> ChatStore:
-    """FastAPI dependency: the process-wide chat store.
+def getConversationStore() -> ConversationStore:
+    """FastAPI dependency: the process-wide conversation store.
 
     One instance for the life of the process, because it holds the Firestore
     and Redis clients and both own connection pools -- building one per request
     would open a new pool per request and leak connections until the server
     refused them.
     """
-    return buildChatStore()
+    return buildConversationStore()

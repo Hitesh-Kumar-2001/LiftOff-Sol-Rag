@@ -122,12 +122,12 @@ def testAMisconfiguredDeploymentFailsAtStartup(monkeypatch) -> None:
     to start stops the rollout and leaves the previous version running.
     """
     from app.main import checkConfiguration
-    from app.stores.chatStore import getChatStore
+    from app.stores.conversationStore import getConversationStore
     from app.stores.projectStore import getProjectStore
 
     monkeypatch.delenv("GCP_PROJECT_ID", raising=False)
     getProjectStore.cache_clear()
-    getChatStore.cache_clear()
+    getConversationStore.cache_clear()
     try:
         with pytest.raises(RuntimeError, match="GCP_PROJECT_ID"):
             checkConfiguration()
@@ -135,4 +135,4 @@ def testAMisconfiguredDeploymentFailsAtStartup(monkeypatch) -> None:
         # The caches are process-wide; leaving a failed build cached, or a
         # store built without a GCP project, would follow every later test.
         getProjectStore.cache_clear()
-        getChatStore.cache_clear()
+        getConversationStore.cache_clear()

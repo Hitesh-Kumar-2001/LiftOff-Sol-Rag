@@ -1,6 +1,6 @@
-"""Check FirestoreChatStore against real Firestore.
+"""Check FirestoreConversationStore against real Firestore.
 
-    python scripts/liveChatCheck.py
+    python scripts/liveConversationCheck.py
 
 Configuration comes from .env, the same as ``liveFirestoreCheck``.
 
@@ -8,9 +8,9 @@ Covers the three things a stand-in client cannot answer for, all of which are
 about the *service* rather than about this code:
 
 * the range queries. ``where(turnIndex >= watermark)`` has to work with no
-  composite index defined, or a summarised chat 404s its own history on the
+  composite index defined, or a summarised conversation 404s its own history on the
   first deployment that has never had one created by hand.
-* the transaction in ``appendTurn``. Two questions arriving in one chat at the
+* the transaction in ``appendTurn``. Two questions arriving in one conversation at the
   same moment must not both claim turn 6 and lose an exchange -- a fake
   transaction always agrees with itself, so only the real one proves this.
 * the round trip of the stored types. ``expiresAt`` goes in as a datetime and
@@ -20,7 +20,7 @@ about the *service* rather than about this code:
 Runs without Redis on purpose: the cache would answer the reads and none of the
 above would be exercised.
 
-Deletes the chat, and both of its subcollections, on the way out.
+Deletes the conversation, and both of its subcollections, on the way out.
 """
 
 from __future__ import annotations
@@ -34,7 +34,7 @@ import sys
 # scripts/liveFirestoreCheck.py.
 import app  # noqa: F401
 
-PROJECT_ID = "live-chat-check"
+PROJECT_ID = "live-conversation-check"
 
 failures: list[str] = []
 
@@ -45,9 +45,9 @@ def check(description: str, condition: bool) -> None:
         failures.append(description)
 
 
-def deleteChat(store, projectId: str, chatId: str) -> None:
+def deleteConversation(store, projectId: str, conversationId: str) -> None:
     """Firestore does not delete subcollections with their parent."""
-    reference = store._chatRef(projectId, chatId)
+    reference = store._conversationRef(projectId, conversationId)
     for name in ("messages", "context"):
         for document in reference.collection(name).stream():
             document.reference.delete()
@@ -58,36 +58,37 @@ async def main() -> None:
     if not os.environ.get("GCP_PROJECT_ID"):
         sys.exit("Set GCP_PROJECT_ID (and GOOGLE_APPLICATION_CREDENTIALS).")
 
-    from app.stores.chatStore import (
+    from app.stores.conversationStore import (
         COLLECTION,
-        ChatWindow,
+        ConversationWindow,
         ContextEntry,
-        FirestoreChatStore,
+        FirestoreConversationStore,
     )
 
     # No Redis: a cache hit would answer the reads below without Firestore ever
     # being asked, which is exactly what must not happen here.
-    store = FirestoreChatStore(redis=None)
+    store = FirestoreConversationStore(redis=None)
     created: list[str] = []
 
     try:
-        print("\n=== creating a chat")
-        chat = await store.createChat(
+        print("\n=== creating a conversation")
+        conversation = await store.createConversation(
             projectId=PROJECT_ID,
             systemPrompt="You are the live-check assistant.",
-            ragDbId="live-chat-check-abc123",
+            ragDbId="live-conversation-check-abc123",
             title="first question",
         )
-        created.append(chat.chatId)
-        check("a chatId was minted", bool(chat.chatId))
-        check("it starts with no turns", chat.turnCount == 0)
+        created.append(conversation.conversationId)
+        check("a conversationId was minted", bool(conversation.conversationId))
+        check("it starts with no turns", conversation.turnCount == 0)
 
-        print("\n=== an unknown chat is None, not an error")
-        check("resolves to nothing", await store.loadWindow(PROJECT_ID, "no-such-chat") is None)
+        print("\n=== an unknown conversation is None, not an error")
+        missing = await store.loadWindow(PROJECT_ID, "no-such-conversation")
+        check("resolves to nothing", missing is None)
 
         print("\n=== appending a turn with what it retrieved")
         window = await store.appendTurn(
-            window=chat,
+            window=conversation,
             question="What is the refund window?",
             answer="Thirty days from purchase.",
             context=[ContextEntry(0, 0, "refund window", ["Refunds: 30 days."])],
@@ -97,7 +98,7 @@ async def main() -> None:
         check("the retrieval was counted", window.contextCount == 1)
 
         print("\n=== reading it back through the service")
-        reloaded = await store.loadWindow(PROJECT_ID, chat.chatId)
+        reloaded = await store.loadWindow(PROJECT_ID, conversation.conversationId)
         check("the prompt survived", reloaded.systemPrompt.startswith("You are the live-check"))
         check(
             "both messages came back in order",
@@ -108,16 +109,19 @@ async def main() -> None:
         # Firestore hands timestamps back as DatetimeWithNanoseconds, which is
         # not JSON-serialisable -- if that reached the cache every write to it
         # would fail, silently, forever.
-        check("the window still serialises for the cache", bool(ChatWindow.fromJson(reloaded.toJson())))
+        check(
+            "the window still serialises for the cache",
+            bool(ConversationWindow.fromJson(reloaded.toJson())),
+        )
 
-        print("\n=== two turns racing the same chat")
+        print("\n=== two turns racing the same conversation")
         # The transaction is the only thing stopping these both claiming turn 2
         # and one exchange disappearing without trace.
         await asyncio.gather(
             store.appendTurn(window=reloaded, question="Gift cards?", answer="No refund.", context=[]),
             store.appendTurn(window=reloaded, question="Vouchers?", answer="No refund.", context=[]),
         )
-        raced = await store.loadWindow(PROJECT_ID, chat.chatId)
+        raced = await store.loadWindow(PROJECT_ID, conversation.conversationId)
         check("both exchanges survived", raced.turnCount == 6)
         check(
             "every turn has its own index",
@@ -127,18 +131,18 @@ async def main() -> None:
         print("\n=== summarising, and the range queries behind it")
         await store.saveSummary(
             projectId=PROJECT_ID,
-            chatId=chat.chatId,
+            conversationId=conversation.conversationId,
             summary="They asked about refunds on several products.",
             throughTurn=4,
             throughContext=1,
         )
-        folded = await store.loadWindow(PROJECT_ID, chat.chatId)
+        folded = await store.loadWindow(PROJECT_ID, conversation.conversationId)
         check("the summary came back", folded.contextSummary.startswith("They asked about refunds"))
         # This is the assertion the whole mechanism rests on: below the
         # watermark, those documents are never read again.
         check("only the tail was read", [m.turnIndex for m in folded.messages] == [4, 5])
         check("the folded retrieval was not read", folded.context == [])
-        check("the counters still describe the whole chat", folded.turnCount == 6)
+        check("the counters still describe the whole conversation", folded.turnCount == 6)
 
         print("\n=== appending after a summary")
         after = await store.appendTurn(
@@ -148,9 +152,9 @@ async def main() -> None:
         check("the summary is still there", after.contextSummary.startswith("They asked"))
     finally:
         print("\n=== cleanup")
-        for chatId in created:
-            deleteChat(store, PROJECT_ID, chatId)
-            print(f"  deleted chat {chatId}")
+        for conversationId in created:
+            deleteConversation(store, PROJECT_ID, conversationId)
+            print(f"  deleted conversation {conversationId}")
         store._db.collection(COLLECTION).document(PROJECT_ID).delete()
         print(f"  deleted {PROJECT_ID}")
 

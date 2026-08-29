@@ -6,32 +6,51 @@ import pytest
 
 from app.agent.llmManager import (
     API_KEY_ENV,
-    DEFAULT_MODEL,
     LlmConfigError,
     Provider,
     _cachedChatModel,
     agentModel,
     asProvider,
     chatModel,
+    chunkerModel,
     reviewerModel,
 )
+from app.modelConfig import ENV_CONFIG_PATH, ENV_OVERRIDES, _readConfig
 
 
 @pytest.fixture(autouse=True)
-def isolatedCache(monkeypatch):
-    """The factory caches clients per process; tests must not share them."""
+def isolatedCache(monkeypatch, tmp_path):
+    """No shared clients, no ambient configuration, no real config file.
+
+    The factory caches clients per process, so tests must not share them. The
+    file is redirected at a tmp_path that does not exist, so a test says what
+    the configuration is or gets a clean "nothing is configured" -- otherwise
+    every assertion here would depend on whatever config/models.toml currently
+    says, and editing that file would break this suite.
+    """
     _cachedChatModel.cache_clear()
+    _readConfig.cache_clear()
     for name in API_KEY_ENV.values():
         monkeypatch.delenv(name, raising=False)
-    for name in (
-        "RAG_AGENT_PROVIDER",
-        "RAG_AGENT_MODEL",
-        "RAG_REVIEWER_PROVIDER",
-        "RAG_REVIEWER_MODEL",
-    ):
-        monkeypatch.delenv(name, raising=False)
+    for providerVar, modelVar in ENV_OVERRIDES.values():
+        monkeypatch.delenv(providerVar, raising=False)
+        monkeypatch.delenv(modelVar, raising=False)
+    monkeypatch.setenv(ENV_CONFIG_PATH, str(tmp_path / "absent.toml"))
     yield
     _cachedChatModel.cache_clear()
+    _readConfig.cache_clear()
+
+
+def configure(monkeypatch, tmp_path, **roles: tuple[str, str]) -> None:
+    """Write a models.toml naming the given roles, and point the loader at it."""
+    body = "\n".join(
+        f'[{role}]\nprovider = "{provider}"\nmodel = "{model}"'
+        for role, (provider, model) in roles.items()
+    )
+    path = tmp_path / "models.toml"
+    path.write_text(body, encoding="utf-8")
+    monkeypatch.setenv(ENV_CONFIG_PATH, str(path))
+    _readConfig.cache_clear()
 
 
 @pytest.mark.parametrize(
@@ -110,33 +129,71 @@ def testOverridesBypassTheCache(monkeypatch) -> None:
     assert plain is not tuned
 
 
-def testTheAgentDefaultsToAnthropic(monkeypatch) -> None:
-    monkeypatch.setenv(API_KEY_ENV[Provider.ANTHROPIC], "test-key")
+def testEachRoleComesFromTheConfigFile(monkeypatch, tmp_path) -> None:
+    """No model name is hardcoded any more -- config/models.toml is the source."""
+    monkeypatch.setenv(API_KEY_ENV[Provider.OPENAI], "test-key")
+    configure(
+        monkeypatch,
+        tmp_path,
+        agent=("openai", "gpt-5.6-luna"),
+        chunker=("openai", "gpt-5.4-mini"),
+    )
 
-    built = agentModel()
-
-    assert type(built).__name__ == "ChatAnthropic"
-    assert DEFAULT_MODEL in repr(built.model)
+    assert agentModel().model_name == "gpt-5.6-luna"
+    assert chunkerModel().model_name == "gpt-5.4-mini"
 
 
-def testTheAgentAndReviewerAreConfiguredSeparately(monkeypatch) -> None:
-    """So the judge can be pointed at a cheaper model without moving the agent."""
+def testEveryRoleIsConfiguredSeparately(monkeypatch, tmp_path) -> None:
+    """So the judge, the summariser and the chunker can each be pointed at a
+    cheaper model without moving the one that answers."""
     monkeypatch.setenv(API_KEY_ENV[Provider.ANTHROPIC], "test-key")
     monkeypatch.setenv(API_KEY_ENV[Provider.GROQ], "test-key")
-    monkeypatch.setenv("RAG_REVIEWER_PROVIDER", "groq")
-    monkeypatch.setenv("RAG_REVIEWER_MODEL", "llama-3.3-70b-versatile")
+    configure(
+        monkeypatch,
+        tmp_path,
+        agent=("anthropic", "claude-opus-5"),
+        reviewer=("groq", "llama-3.3-70b-versatile"),
+    )
 
     assert type(agentModel()).__name__ == "ChatAnthropic"
     assert type(reviewerModel()).__name__ == "ChatGroq"
 
 
-def testANonDefaultProviderMustNameItsModel(monkeypatch) -> None:
-    """A model name is not portable between vendors, so naming a provider
-    without one is a configuration mistake, not something to guess at."""
+def testTheEnvironmentOverridesTheFile(monkeypatch, tmp_path) -> None:
+    """What lets one container be pointed elsewhere without a rebuild."""
     monkeypatch.setenv(API_KEY_ENV[Provider.OPENAI], "test-key")
+    configure(monkeypatch, tmp_path, agent=("openai", "gpt-5.6-luna"))
+    monkeypatch.setenv("RAG_AGENT_PROVIDER", "openai")
+    monkeypatch.setenv("RAG_AGENT_MODEL", "gpt-5.4-mini")
+
+    assert agentModel().model_name == "gpt-5.4-mini"
+
+
+def testAnOverriddenProviderMustNameItsModel(monkeypatch, tmp_path) -> None:
+    """A model name is not portable between vendors, so half-overriding a role
+    -- provider from the environment, model from the file -- is refused rather
+    than silently pairing the two."""
+    monkeypatch.setenv(API_KEY_ENV[Provider.OPENAI], "test-key")
+    configure(monkeypatch, tmp_path, agent=("anthropic", "claude-opus-5"))
     monkeypatch.setenv("RAG_AGENT_PROVIDER", "openai")
 
     with pytest.raises(LlmConfigError) as raised:
         agentModel()
 
     assert "RAG_AGENT_MODEL" in str(raised.value)
+
+
+def testAnUnconfiguredRoleNamesTheFileAndTheRole(monkeypatch) -> None:
+    """A 503 that says where to go is worth more than one that says what broke."""
+    monkeypatch.setenv(API_KEY_ENV[Provider.OPENAI], "test-key")
+
+    with pytest.raises(LlmConfigError) as raised:
+        chunkerModel()
+
+    message = str(raised.value)
+    assert "chunker" in message
+    # The path it actually looked at, not a generic "config file": with
+    # RAG_MODEL_CONFIG in play the two can differ, and the one worth printing
+    # is the one that was read.
+    assert ".toml" in message
+    assert "RAG_CHUNKER_PROVIDER" in message

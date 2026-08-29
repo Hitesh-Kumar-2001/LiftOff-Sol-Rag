@@ -1,6 +1,6 @@
 ---
 name: rag-api
-description: Context for this repo — an unauthenticated FastAPI RAG service (async document ingestion, Gemini chunking, Pinecone vector store, Redis job table and queue, Firestore project mapping and chat history, a worker process, and a deepagents answering agent over anthropic/openai/groq/gemini). Load before reading, changing, debugging, or extending any code under app/, api/, scripts/, or tests/, or when asked how ingestion, jobs, projects, search, chats, the agent, or deployment work here.
+description: Context for this repo — an unauthenticated FastAPI RAG service (async document ingestion, Gemini chunking, Pinecone vector store, Redis job table and queue, Firestore project mapping and conversation history, a worker process, and a deepagents answering agent over anthropic/openai/groq/gemini). Load before reading, changing, debugging, or extending any code under app/, api/, scripts/, or tests/, or when asked how ingestion, jobs, projects, search, conversations, the agent, or deployment work here.
 ---
 
 # RAG API — project context
@@ -27,14 +27,16 @@ docker compose up --build                 # api + worker + redis
 Layout: `app/api` (routes, schemas), `app/agent` (LLM manager, prompt store, tools,
 reviewer, summariser, the loop), `app/jobs` (record, manager, Redis store, queue,
 worker), `app/ingestion` (documents, selector, pipeline, processor), `app/stores`
-(chunk stores, project mapping, chat store), `app/infra` (Redis/Firestore clients,
+(chunk stores, project mapping, conversation store), `app/infra` (Redis/Firestore clients,
 machine stats).
 
 `scripts/live*Check.py` run against real infrastructure and are deliberately outside
 the test suite (they cost money / need network): `liveFirestoreCheck` (project mapping),
-`liveChatCheck` (chat store — the append transaction and the summary range queries),
+`liveConversationCheck` (conversation store — the append transaction and the summary range queries),
 `livePineconeCheck` (store), `liveIngestionCheck <url>` (whole pipeline, real Gemini
-and Pinecone). They read `.env`. **The suite reads it too** — there are no in-process
+and Pinecone). `scripts/migrateChatsToConversations.py` is the one-off that carried the
+old `ragChats` tree onto `ragConversations`; it is a dry run without `--apply`, copies
+rather than moves, and is idempotent. They read `.env`. **The suite reads it too** — there are no in-process
 stores, so `tests/conftest.py` requires `GCP_PROJECT_ID` and runs against real Firestore,
 prefixing every id per run and deleting what it created. Redis is `fakeredis`, in-process,
 so the real `QueuedJobManager` and `RedisJobStore` are exercised without a server.
@@ -47,7 +49,9 @@ in the API.
 
 | Route | Does |
 | --- | --- |
-| `POST /api/v1/query` | Runs the answering agent (`app/agent/`). Takes an optional `chatId` and always returns one — see *Chats*. 404 unknown `chatId`, 502 provider failure, 503 no model configured, 504 past `RAG_ANSWER_TIMEOUT_SECONDS`. |
+| `POST /api/v1/query` | The one-call form: answers, and starts a conversation if none was named. Takes an optional `conversationId` and always returns one — see *Conversations*. 404 unknown id, 502 provider failure, 503 no model configured, 504 past `RAG_ANSWER_TIMEOUT_SECONDS`. |
+| `POST /api/v1/conversation` | Creates an empty conversation and returns its `conversationId` plus the `systemPrompt` snapshotted onto it. 201. Resolves the project read-only — starting one never mints a `ragDbId`. 503 if the conversation store is unreachable, because unlike the answering routes there is nothing to degrade to. |
+| `POST /api/v1/conversation/message` | Posts a question to an existing conversation. `conversationId` is **required** — that is the only difference from `/query`, and both run the same `_runTurn`. Loads the window Redis-first. Same 404/502/503/504. |
 | `POST /api/v1/document` | Resolves-or-creates the project's database, claims it, queues ingestion, returns 202. 409 on conflict, 503 on dispatch failure. |
 | `POST /api/v1/document/status` | Job status. Returns `projectId` normally, or `documentLink` when the strategy was RAW. 404 if the project or its job is unknown. |
 | `POST /api/v1/search` | Retrieval only — the matching chunks, not a generated answer. An unresolved project gives empty hits, not a 404. |
@@ -58,7 +62,7 @@ in the API.
 **API layer** — [app/main.py](app/main.py) builds the app (the lifespan runs
 `checkConfiguration()` so a bad config fails the deploy, and awaits in-flight jobs on
 shutdown) and owns the 422 handler that allowlists `type`/`loc`/`msg`
-so a malformed request is not echoed back. [app/api/routes.py](app/api/routes.py) has the four
+so a malformed request is not echoed back. [app/api/routes.py](app/api/routes.py) has the six
 routes and is where `projectId` becomes `ragDbId`. [app/api/schemas.py](app/api/schemas.py) is
 the wire contract. [app/stores/projectStore.py](app/stores/projectStore.py) holds the mapping —
 `ProjectStore` protocol, the Firestore implementation, `buildProjectStore()`
@@ -70,9 +74,13 @@ for `/health`.
 continued from the first run's transcript. [app/agent/llmManager.py](app/agent/llmManager.py)
 turns `(provider, model)` into a `BaseChatModel` for anthropic/openai/groq/gemini; vendor
 imports live *inside* the builder functions, `model` is required, and clients are
-`lru_cache`d because each owns a connection pool.
+`lru_cache`d because each owns a connection pool. **It holds no model names** — the four
+role functions (`agentModel`, `reviewerModel`, `summariserModel`, `chunkerModel`) read
+`config/models.toml` through [app/modelConfig.py](app/modelConfig.py); see *Model configuration*.
 [app/agent/promptStore.py](app/agent/promptStore.py) resolves a project's system prompt from
-two Firestore collections and caches the *resolved text keyed by projectId* in Redis.
+two Firestore collections and caches the *resolved text keyed by projectId* in Redis; the
+default it falls back to is the **persona** in `config/prompts.toml`, read by
+[app/promptConfig.py](app/promptConfig.py) — see *Persona*.
 [app/agent/tools.py](app/agent/tools.py) builds `searchProject` (closed over one `ragDbId`
 *and* an optional `searchLog` that records what it retrieved) and Tavily.
 [app/agent/reviewer.py](app/agent/reviewer.py) grades an answer 0.0–1.0 with an
@@ -80,10 +88,15 @@ optional suggestion. [app/agent/summariser.py](app/agent/summariser.py) renders 
 conversation into prompt + messages, and folds it down when it outgrows
 `RAG_CONTEXT_SUMMARY_TOKENS`.
 
-**Chats** — [app/stores/chatStore.py](app/stores/chatStore.py) is the storage:
-`ragChats/{projectId}/chats/{chatId}` with `messages` and `context` subcollections,
-Redis in front, `ChatStore` protocol + Firestore + factory. Full schema and
-rationale in [docs/chatSchema.md](docs/chatSchema.md) — read that before changing
+**Conversations** — one word, all the way down: the URL, the wire field, the class, the
+Firestore collections and the stored field are all `conversation`. It was `chat` in the
+storage layer until the rename; `scripts/migrateChatsToConversations.py` is what carried
+the existing `ragChats` tree across, and it copies rather than moves, so the old tree is
+still there to roll back to.
+[app/stores/conversationStore.py](app/stores/conversationStore.py) is the storage:
+`ragConversations/{projectId}/conversations/{conversationId}` with `messages` and `context` subcollections,
+Redis in front, `ConversationStore` protocol + Firestore + factory. Full schema and
+rationale in [docs/conversationSchema.md](docs/conversationSchema.md) — read that before changing
 anything about how a conversation is stored.
 
 **Auth** — none. There is no auth module; see the note at the top.
@@ -119,29 +132,114 @@ second process from the same image: `python -m app.jobs.worker`. `app/__init__.p
 - `< 2000` → **RAW** — stored whole, one chunk. *No vector DB is meaningfully populated*,
   so `/document/status` answers with `documentLink` instead of a queryable project.
 - `< 10000` → **NON_AI** — 400-token windows, 40-token overlap.
-- otherwise → **AI** — Gemini (`gemini-3.5-flash-lite`, pinned) picks boundaries, one
-  call per blank-line section, 8 concurrent, `response_schema=list[str]`. A section whose
-  answer will not parse falls back to non-AI chunking rather than losing the document.
-  `>= 100000` tokens logs a warning and proceeds.
+- otherwise → **AI** — the `[chunker]` model picks boundaries, one call per blank-line
+  section, 8 concurrent, through `with_structured_output(ChunkList)`. A section whose
+  answer will not parse, or comes back empty, falls back to non-AI chunking rather than
+  losing the document; a *call* that fails fails the whole job, because a bad key or an
+  exhausted quota fails every section identically and silently non-AI-chunking a whole
+  corpus stores a database that looks successful. `>= 100000` tokens logs a warning and
+  proceeds.
+
+  This used to call Gemini through `google-genai` directly, with its own key and its own
+  pinned model name. It was the only AI call in the service that could not be repointed
+  without editing code, and the one whose per-day quota stopped a large ingestion dead.
 
 Every strategy's output then passes `enforceEmbedLimit` — anything over
 `RAG_MAX_EMBED_TOKENS` (2048) is re-split, because Pinecone's embedder silently truncates
 the tail instead of erroring.
 
+## Model configuration
+
+Four roles, one file: [config/models.toml](config/models.toml).
+
+| Role | Called | Notes |
+| --- | --- | --- |
+| `agent` | once per `/query` | answers the question |
+| `reviewer` | once per `/query` | grades the answer 0.0–1.0 |
+| `summariser` | when a conversation outgrows its budget | on the critical path; worth a small fast model |
+| `chunker` | **once per blank-line section of every AI-chunked document** | by far the highest call volume; the role a request quota stops first |
+
+Each section names a `provider` (anthropic/openai/groq/gemini) and a `model`, and both
+are required. [app/modelConfig.py](app/modelConfig.py) resolves them; nothing else in the
+codebase names a model.
+
+- **Precedence is environment, then file, then error.** `RAG_<ROLE>_PROVIDER` /
+  `RAG_<ROLE>_MODEL` override one role so a container can be repointed without a rebuild.
+  `.env` deliberately leaves all eight unset, because with them set, editing the file
+  would appear to do nothing.
+- **Provider and model always move together.** Half-overriding a role — provider from the
+  environment, model from the file — is refused, because a model name is not portable
+  between vendors and the failure would otherwise arrive as a 404 from the vendor.
+- **No defaults.** A default model here would be four vendors' current model names living
+  in code and going stale the first time any of them ships a new one — which is exactly
+  how `gemini-2.0-flash` came to be pinned in the chunker until Google retired it.
+- **`app.main.checkConfiguration` resolves all four at startup** and logs what each
+  resolved to and where from, so a missing `[chunker]` fails the deploy rather than a
+  worker job hours later.
+- The API keys stay in the environment (`llmManager.API_KEY_ENV`). The file is committed;
+  keys are not.
+
+`config/` is copied into the image by the `Dockerfile`; `app/modelConfig.py` locates it
+relative to the package, not the working directory, because uvicorn, the worker and
+pytest all start from somewhere different.
+
+## Persona — what the agent is
+
+[config/prompts.toml](config/prompts.toml) holds named personas. Each is a `systemPrompt`
+and an optional `reviewCriteria`; `default` at the top picks the active one.
+[app/promptConfig.py](app/promptConfig.py) reads it.
+
+**The service ships selling.** `default = "sales"` — a consultative sales representative
+that qualifies the need, connects an answer to a concrete outcome, and closes on one next
+step. `default = "support"` is the original neutral retrieval-grounded assistant, kept for
+an internal handbook or a policy corpus where a sales register would be actively wrong.
+
+Where a prompt comes from, highest first:
+
+1. the project's own prompt in Firestore, if assigned — `promptStore` resolves that and
+   never reads this file;
+2. `RAG_DEFAULT_SYSTEM_PROMPT` — a whole prompt in an env var. Predates the file, still
+   wins. Suppresses `reviewCriteria` too, since criteria describing one prompt would
+   penalise a different one;
+3. `RAG_PERSONA` naming a persona in the file;
+4. the file's `default`;
+5. `FALLBACK_SYSTEM_PROMPT` in `promptConfig` — the neutral assistant, deliberately *not*
+   the sales one, on the grounds that if configuration has gone missing the safe thing to
+   be is accurate and dull rather than a salesperson improvising without its script.
+
+**Two entry points, and the split is the point.** `validatePersona()` raises and is called
+by `checkConfiguration`, so a `RAG_PERSONA` naming something that does not exist stops the
+deploy — the failure is otherwise silent, because the service answers perfectly well as
+somebody other than the assistant that was configured. `defaultSystemPrompt()` and
+`reviewCriteria()` never raise: they are on the path of a live question, and a prompt
+lookup must not cost an answer.
+
+**`reviewCriteria` exists because the reviewer otherwise pulls against the persona.** It
+grades "does this answer the question", so a flat factual dump that ignores everything the
+sales persona was told scores 1.0 and the persona has no feedback loop. The shipped
+criteria are worded so honesty outranks selling — see invariant 29. `tests/testPromptConfig.py`
+asserts the guardrails in the shipped copy (retrieve before claiming, no invented urgency,
+no payment details, never claim to be human) so an edit that drops one fails a test rather
+than a customer.
+
+Unlike `config/models.toml` there *is* a built-in fallback here: a default model name goes
+stale the moment a vendor retires it, whereas a default prompt is prose with no vendor
+behind it and works forever.
+
 ## Where things run
 
 **There is exactly one shape, and no in-process fallback anywhere.** `REDIS_URL` and
 `GCP_PROJECT_ID` are both required; each of `buildJobManager`, `buildProjectStore` and
-`buildChatStore` raises without them, and `app.main.checkConfiguration` calls all of them
+`buildConversationStore` raises without them, and `app.main.checkConfiguration` calls all of them
 in the lifespan so a misconfigured deployment fails at **startup** rather than 500ing every
 request behind a green `/health`.
 
 | Needs | Holds | Work runs |
 | --- | --- | --- |
 | `REDIS_URL` | job table + queue | `python -m app.jobs.worker` |
-| `GCP_PROJECT_ID` | `projectId`→`ragDbId` mapping, chats, prompts | — |
+| `GCP_PROJECT_ID` | `projectId`→`ragDbId` mapping, conversations, prompts | — |
 
-The dict-backed job manager, `InMemoryProjectStore`, `InMemoryChatStore` and
+The dict-backed job manager, `InMemoryProjectStore`, `InMemoryConversationStore` and
 `InMemoryChunkStore` are all gone. They were two problems, not one: state died with the
 process, and the job manager ran chunking on the API's own event loop, so a large document
 froze every other request — health check included — and the platform killed a task that was
@@ -252,27 +350,36 @@ so no misconfiguration can quietly downgrade a real deployment.
     where same-caller-same-document means REUSE and a different caller means CONFLICT —
     the one place an unverified value still steers behaviour. Do not add anything that
     grants access based on it without adding authentication first.
-23. **Chats are keyed by `projectId`, never by `ragDbId`.** `/query` runs with
+23. **Conversations are keyed by `projectId`, never by `ragDbId`.** `/query` runs with
    `ragDbId` None, so there would be no key for a project's first conversation; and a
    `ragDbId` is deliberately changeable (invariant 4), so keying on it would orphan
-   every conversation the day a project is rebuilt. The `ragDbId` on a chat document is
+   every conversation the day a project is rebuilt. The `ragDbId` on a conversation document is
    audit only — nothing resolves retrieval from it.
 24. **Nothing about storing a conversation may fail a `/query`.** The model call is the
-   expensive, irreversible step. An unreachable chat store answers without history; a
-   failed write logs and still returns the answer. Only an unknown `chatId` is an error
+   expensive, irreversible step. An unreachable conversation store answers without history; a
+   failed write logs and still returns the answer. Only an unknown `conversationId` is an error
    (404), and that is thrown *before* the model runs.
-25. **An unknown `chatId` is a 404, not a new chat.** A typo silently opening a fresh
-   conversation is indistinguishable, to the caller, from a model that forgot everything.
+25. **An unknown `conversationId` is a 404, not a new conversation.** A typo silently
+   opening a fresh one is indistinguishable, to the caller, from a model that forgot
+   everything. `/conversation/message` additionally *requires* the id, so it can never
+   create one.
 26. **`appendTurn` is a transaction, and turn indices come from the stored counter.**
-   Two questions racing one chat would otherwise both write `messages/000006` and lose
+   Two questions racing one conversation would otherwise both write `messages/000006` and lose
    an exchange. Do not turn it into a batch.
 27. **The summariser runs before the answer, and its failure is never fatal.**
    Summarising afterwards leaves the turn that tripped the budget to be answered with
    the prompt that tripped it. Every failure path falls through to `trimToBudget`, which
    drops the oldest *retrievals* from what is sent and never a message.
-28. **A chat answers with the `systemPrompt` snapshotted onto it**, not the project's
+28. **A conversation answers with the `systemPrompt` snapshotted onto it**, not the project's
    current one. Re-resolving per turn lets an edit rewrite the instructions earlier
    answers were given under.
+29. **In a persona's `reviewCriteria`, honesty outranks selling.** The sales criteria
+   explicitly say an answer that declines to invent a price, a feature, a discount or a
+   deadline is a *good* answer. Do not reverse that. The reviewer already has one known
+   failure mode where an honest "the documents do not cover this" is marked down and
+   retried (invariant 19); criteria that rewarded selling harder would turn that into an
+   agent whose fastest route to a high score is to make something up, and an invented
+   price is the most expensive thing this configuration can produce.
 
 ## Conventions
 
@@ -291,7 +398,7 @@ so no misconfiguration can quietly downgrade a real deployment.
 - Blocking SDKs (Firestore, Pinecone, kombu publish) are always wrapped in
   `asyncio.to_thread`.
 - Process-wide singletons are **all** `lru_cache`d and built lazily: `getJobManager()`,
-  `getProjectStore()`, `getChatStore()`, `getChunkStore()`. Importing a module no longer
+  `getProjectStore()`, `getConversationStore()`, `getChunkStore()`. Importing a module no longer
   requires a working environment — that used to be true of `JOB_MANAGER` and was a
   standing footgun. `app.main.checkConfiguration` builds all four during startup, so
   laziness costs nothing in fail-fast behaviour.
@@ -313,42 +420,47 @@ so no misconfiguration can quietly downgrade a real deployment.
 | `RAG_QUEUE_POP_TIMEOUT` / `RAG_REDIS_TIMEOUT` | Worker block, and socket timeout. Default 5s each. |
 | `RAG_STALE_JOB_SECONDS` | Reclaim age for a stuck job. See invariant 6. |
 | `PINECONE_API_KEY`, `RAG_PINECONE_INDEX`/`_CLOUD`/`_REGION`/`_EMBED_MODEL` | Index `rag-chunks`, aws/us-east-1, `llama-text-embed-v2` — server-side embedding, so nothing here embeds. |
-| `GEMINI_API_KEY`, `RAG_GEMINI_MODEL` | AI chunking. |
 | `RAG_TEST_MODE`, `RAG_LOCAL_STORE_DIR` | Local JSON chunk store instead of Pinecone. |
 | `RAG_MAX_EMBED_TOKENS`, `RAG_AI_CHUNK_CONCURRENCY` | 2048, 8. |
 | `RAG_UNRAR_TOOL` | `.rar` needs an external unrar/bsdtar/7z binary on the machine. |
 | `TIKTOKEN_CACHE_DIR` | tiktoken downloads its BPE data on first use; point this somewhere that survives restarts. |
 | `RAG_HEALTH_DISK_PATH` | Which filesystem `/health` reports on. Defaults to the working directory. |
-| `ANTHROPIC_API_KEY` | Default agent + reviewer provider. Without it `/query` is 503. |
-| `OPENAI_API_KEY` / `GROQ_API_KEY` | Only for those providers. Gemini reuses `GEMINI_API_KEY`. |
-| `RAG_AGENT_PROVIDER` / `RAG_AGENT_MODEL` | Default `anthropic` / `claude-opus-5`. A non-default provider **must** name a model. |
-| `RAG_REVIEWER_PROVIDER` / `RAG_REVIEWER_MODEL` | Same defaults, configured separately. |
+| `OPENAI_API_KEY` / `ANTHROPIC_API_KEY` / `GROQ_API_KEY` / `GEMINI_API_KEY` | One per provider any role names. A role whose key is missing raises `LlmConfigError`, which is a 503 on `/query`. |
+| `RAG_MODEL_CONFIG` | Where `config/models.toml` lives. Defaults to `config/models.toml` beside the `app` package. |
+| `RAG_AGENT_PROVIDER` / `RAG_AGENT_MODEL` | Overrides `[agent]`. Both or neither. |
+| `RAG_REVIEWER_PROVIDER` / `RAG_REVIEWER_MODEL` | Overrides `[reviewer]`. |
+| `RAG_CHUNKER_PROVIDER` / `RAG_CHUNKER_MODEL` | Overrides `[chunker]` — the ingestion chunker. |
 | `RAG_REVIEW_THRESHOLD` | Retry below this. Default 0.7; the reviewer prompt is interpolated from it. |
 | `RAG_ANSWER_TIMEOUT_SECONDS` | Whole-question bound. Default 120. |
 | `TAVILY_API_KEY` | Unset → the agent never sees a web-search tool. |
 | `RAG_AGENT_SEARCH_TOP_K` / `RAG_TAVILY_MAX_RESULTS` | 6, 5. |
-| `RAG_DEFAULT_SYSTEM_PROMPT`, `RAG_PROMPT_TTL_SECONDS`, `RAG_PROMPT_CACHE_PREFIX` | Default prompt, 3600s, `ragPrompt:`. |
+| `RAG_PERSONA` | Which persona in `config/prompts.toml` is active. Overrides its `default`. An unknown name fails startup. |
+| `RAG_PROMPT_CONFIG` | Where `config/prompts.toml` lives. |
+| `RAG_DEFAULT_SYSTEM_PROMPT`, `RAG_PROMPT_TTL_SECONDS`, `RAG_PROMPT_CACHE_PREFIX` | A whole prompt, overriding the persona entirely (and suppressing its review criteria); 3600s; `ragPrompt:`. |
 | `FIRESTORE_PROMPTS_COLLECTION` / `FIRESTORE_PROJECT_PROMPTS_COLLECTION` | `systemPrompts` / `projectPrompts`. |
-| `FIRESTORE_CHATS_COLLECTION` | `ragChats`. The chat root; see [docs/chatSchema.md](docs/chatSchema.md). |
-| `RAG_CHAT_CACHE_PREFIX` / `RAG_CHAT_CACHE_TTL_SECONDS` | `ragChat:`, 3600. The assembled window in Redis. |
-| `RAG_CHAT_TTL_SECONDS` | 90 days, written as `expiresAt`. Deletes nothing without a TTL policy on `chats`, `messages` and `context`. |
-| `RAG_CHAT_MAX_MESSAGE_CHARS` / `RAG_CHAT_MAX_PASSAGE_CHARS` | 20000, 4000. Keeps one huge turn away from the 1 MiB document limit. |
+| `FIRESTORE_CONVERSATIONS_COLLECTION` | `ragConversations`. The conversation root; see [docs/conversationSchema.md](docs/conversationSchema.md). |
+| `RAG_CONVERSATION_CACHE_PREFIX` / `RAG_CONVERSATION_CACHE_TTL_SECONDS` | `ragConversation:`, 3600. The assembled window in Redis. |
+| `RAG_CONVERSATION_TTL_SECONDS` | 90 days, written as `expiresAt`. Deletes nothing without a TTL policy on `conversations`, `messages` and `context`. |
+| `RAG_CONVERSATION_MAX_MESSAGE_CHARS` / `RAG_CONVERSATION_MAX_PASSAGE_CHARS` | 20000, 4000. Keeps one huge turn away from the 1 MiB document limit. |
 | `RAG_CONTEXT_SUMMARY_TOKENS` / `RAG_CONTEXT_KEEP_TURNS` / `RAG_CONTEXT_SUMMARY_MAX_CHARS` | 6000, 4, 6000. When to fold, what survives verbatim, and the cap on the summary. |
-| `RAG_SUMMARISER_PROVIDER` / `RAG_SUMMARISER_MODEL` | Same defaults as the agent; configured separately because this is the call most worth pointing at a small fast model. |
+| `RAG_SUMMARISER_PROVIDER` / `RAG_SUMMARISER_MODEL` | Overrides `[summariser]`. |
 
 No credential configuration exists — the API authenticates nobody. The keys above are
 this service's own credentials for the infrastructure it calls, not its callers'.
 
 ## Known gaps and drift
 
-- **Chats have no list, read-back, or delete endpoint.** The data is shaped for a list
-  (`title`, `lastMessage`, `updatedAt` are denormalised onto the chat document for
-  exactly that) but nothing serves it. Deleting a chat means deleting both
-  subcollections first — Firestore does not remove them with the parent; see
-  `deleteChat` in `scripts/liveChatCheck.py`.
-- **`expiresAt` is written on every chat document but deletes nothing** until a TTL
-  policy is created in the Firestore console on each of `chats`, `messages`, `context`.
-- **Web search results are not stored on a chat.** Only `searchProject` retrievals are.
+- **Conversations can be created and continued, but not listed, read back, or deleted.**
+  `POST /api/v1/conversation` starts one and `/conversation/message` continues it;
+  nothing serves the list, the transcript, or a delete. The data is shaped
+  for a list (`title`, `lastMessage`, `updatedAt` are denormalised onto the conversation document
+  for exactly that) but no endpoint reads them, so a UI can open a conversation and
+  continue it, and cannot show the user the ones they already had. Deleting a conversation means
+  deleting both subcollections first — Firestore does not remove them with the parent;
+  see `deleteConversation` in `scripts/liveConversationCheck.py`.
+- **`expiresAt` is written on every conversation document but deletes nothing** until a TTL
+  policy is created in the Firestore console on each of `conversations`, `messages`, `context`.
+- **Web search results are not stored on a conversation.** Only `searchProject` retrievals are.
 - **No endpoint writes system prompts.** `PromptStore.savePrompt` / `assignPrompt` exist
   and are tested; the Firestore collections are edited by hand today.
 - **No authentication or access control of any kind.** Removed deliberately. Every

@@ -11,7 +11,7 @@ searches them. Managed with `uv`.
 
 **Status:** ingestion, chunking, embedding, retrieval, and answering are built
 and tested. What is not is listed under
-[What isn't built yet](#what-isnt-built-yet) — chat history is the main gap:
+[What isn't built yet](#what-isnt-built-yet) — conversation history is the main gap:
 every question is a single turn today.
 
 ## Run locally
@@ -64,23 +64,42 @@ somewhere else with `RAG_HEALTH_DISK_PATH`.
 
 ## Asking a question
 
-`POST /api/v1/query` takes the calling server's id and the question in one JSON
-body:
+Two shapes, depending on who keeps the conversation id.
+
+**One call.** `POST /api/v1/query` answers, and starts a conversation if none
+was named. The id comes back on the response and is what a follow-up sends:
 
 ```json
 {
   "serverId": "billing-service",
   "question": "What is the refund window?",
-  "projectId": "handbook"
+  "projectId": "handbook",
+  "conversationId": "3f2a…"
 }
 ```
 
 ```json
 {
   "answer": "...",
-  "projectId": "handbook"
+  "projectId": "handbook",
+  "conversationId": "3f2a…"
 }
 ```
+
+**Two calls.** `POST /api/v1/conversation` creates an empty conversation and
+returns its `conversationId` and the system prompt snapshotted onto it (201);
+`POST /api/v1/conversation/message` then posts questions to it. Use this when
+the id is needed *before* there is a question — a UI opening a new conversation
+has a window to render and a record to attach to the user the moment the user
+clicks, and none of that can wait on a model call.
+
+`conversationId` is required on `/conversation/message`, and an id the project
+has no conversation for is a **404** rather than a new conversation: a typo
+silently starting a fresh one looks, to the caller, exactly like a model that
+has forgotten everything they said.
+
+What a conversation already knows is loaded **Redis first**, and rebuilt from
+Firestore only on a miss — see [docs/conversationSchema.md](docs/conversationSchema.md).
 
 | Status | Meaning |
 | ------ | ------- |
@@ -91,7 +110,8 @@ body:
 | 504 | The agent did not finish inside `RAG_ANSWER_TIMEOUT_SECONDS` |
 
 `serverId` says *who is asking*, for the log and nothing else; `question` +
-`projectId` say *what to answer and from where*.
+`projectId` say *what to answer and from where*; `conversationId` says *which
+conversation it belongs to*.
 
 A 502's `detail` names the exception type and nothing else. Provider errors
 quote the prompt back, and the prompt is another project's configuration; the
@@ -419,24 +439,32 @@ Two things are known and accepted rather than fixed:
 
 | Variable | Effect |
 | -------- | ------ |
-| `ANTHROPIC_API_KEY` | The default provider's key. Without it, `/query` answers 503. |
-| `OPENAI_API_KEY` / `GROQ_API_KEY` / `GEMINI_API_KEY` | Only needed for the providers actually named below. `GEMINI_API_KEY` is shared with the chunking pipeline. |
-| `RAG_AGENT_PROVIDER` / `RAG_AGENT_MODEL` | Which model answers. Default `anthropic` / `claude-opus-5`. Naming a non-default provider **requires** a model — a model name is not portable between vendors. |
-| `RAG_REVIEWER_PROVIDER` / `RAG_REVIEWER_MODEL` | Which model grades. Same defaults, set separately so the judge can be a cheaper model without moving the agent. |
+| `OPENAI_API_KEY` / `ANTHROPIC_API_KEY` / `GROQ_API_KEY` / `GEMINI_API_KEY` | One per provider named in `config/models.toml`. A role whose key is missing answers 503. |
+| `RAG_MODEL_CONFIG` | Where `config/models.toml` lives. That file names the model for each of the four roles — agent, reviewer, summariser, chunker — and nothing in the code names one. |
+| `RAG_AGENT_PROVIDER` / `RAG_AGENT_MODEL` | Overrides `[agent]` for one deployment. Both or neither: a model name is not portable between vendors. |
+| `RAG_REVIEWER_PROVIDER` / `RAG_REVIEWER_MODEL` | Overrides `[reviewer]`, set separately so the judge can be a cheaper model without moving the agent. |
+| `RAG_SUMMARISER_PROVIDER` / `RAG_SUMMARISER_MODEL` | Overrides `[summariser]`. |
+| `RAG_CHUNKER_PROVIDER` / `RAG_CHUNKER_MODEL` | Overrides `[chunker]` — the model that picks chunk boundaries during ingestion. |
 | `RAG_REVIEW_THRESHOLD` | Score below which an answer is retried once. Default `0.7`. The reviewer's prompt is interpolated from this, so the two cannot disagree. |
 | `RAG_ANSWER_TIMEOUT_SECONDS` | Upper bound on one whole question — turns, tool calls, review, retry. Default 120. |
 | `TAVILY_API_KEY` | Enables web search. Unset, the agent simply never sees the tool. |
 | `RAG_AGENT_SEARCH_TOP_K` | Chunks per retrieval call. Default 6. |
 | `RAG_TAVILY_MAX_RESULTS` | Web results per search. Default 5. |
-| `RAG_DEFAULT_SYSTEM_PROMPT` | What a project with no prompt assigned answers with. |
+| `RAG_PERSONA` | Which persona in `config/prompts.toml` the agent is. Ships as `sales`; `support` is the neutral retrieval-grounded assistant. An unknown name fails startup. |
+| `RAG_PROMPT_CONFIG` | Where `config/prompts.toml` lives. |
+| `RAG_DEFAULT_SYSTEM_PROMPT` | A whole prompt, overriding the persona entirely. Suppresses its review criteria too. |
 | `RAG_PROMPT_TTL_SECONDS` | How long a resolved prompt is served before Firestore is re-read. Default 1 hour. |
 | `FIRESTORE_PROMPTS_COLLECTION` / `FIRESTORE_PROJECT_PROMPTS_COLLECTION` | Default `systemPrompts` and `projectPrompts`. |
 | `RAG_PROMPT_CACHE_PREFIX` | Redis key prefix for cached prompts. Default `ragPrompt:`. |
 
 There is no credential configuration: the API does not authenticate anyone.
-`GOOGLE_APPLICATION_CREDENTIALS`, `PINECONE_API_KEY`, `GEMINI_API_KEY`, and the
-model keys above are this service's own credentials for the infrastructure it
-calls, not its callers'.
+`GOOGLE_APPLICATION_CREDENTIALS`, `PINECONE_API_KEY`, and the model keys above
+are this service's own credentials for the infrastructure it calls, not its
+callers'.
+
+The two `config/` files hold everything that is a *choice* rather than a secret
+— which model does which job, and who the agent is. They are committed and
+reviewable; the keys are not.
 
 ## Docker
 
@@ -459,9 +487,9 @@ an image — so it is mounted read-only at run time instead. Point
 
 ## What isn't built yet
 
-- **Chat history.** Every `/query` is a single turn. The retry continues that
+- **Conversation history.** Every `/query` is a single turn. The retry continues that
   turn's conversation, but nothing persists between requests, so a caller cannot
-  ask a follow-up. This is where a `chatHistory` collection would land.
+  ask a follow-up. This is where a `conversationHistory` collection would land.
 - **Prompt administration.** `PromptStore.savePrompt` and `assignPrompt` are
   written and tested but no endpoint calls them; the two Firestore collections
   are edited by hand today.

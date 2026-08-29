@@ -10,11 +10,8 @@ import asyncio
 import fakeredis
 import pytest
 
-from app.agent.promptStore import (
-    DEFAULT_SYSTEM_PROMPT,
-    PROMPT_TTL_SECONDS,
-    PromptStore,
-)
+from app.agent.promptStore import PROMPT_TTL_SECONDS, PromptStore
+from app.promptConfig import defaultSystemPrompt
 
 PROJECT = "acme"
 PROMPT_ID = "support-v3"
@@ -132,7 +129,7 @@ def testNothingIsCachedInProcessMemory(redis, firestore) -> None:
 
 def testAProjectWithNoPromptGetsTheDefault(store: PromptStore) -> None:
     """Otherwise every new project's first question would fail."""
-    assert asyncio.run(store.systemPromptFor("never-configured")) == DEFAULT_SYSTEM_PROMPT
+    assert asyncio.run(store.systemPromptFor("never-configured")) == defaultSystemPrompt()
 
 
 def testADanglingAssignmentGetsTheDefault(redis) -> None:
@@ -141,7 +138,7 @@ def testADanglingAssignmentGetsTheDefault(redis) -> None:
     firestore = FakeFirestore(assignments={PROJECT: {"promptId": "gone"}}, prompts={})
     store = PromptStore(redis=redis, firestore=firestore)
 
-    assert asyncio.run(store.systemPromptFor(PROJECT)) == DEFAULT_SYSTEM_PROMPT
+    assert asyncio.run(store.systemPromptFor(PROJECT)) == defaultSystemPrompt()
 
 
 class BrokenFirestore:
@@ -153,7 +150,7 @@ def testAFirestoreFailureStillAnswers(redis) -> None:
     """A prompt lookup failing must not fail the question."""
     store = PromptStore(redis=redis, firestore=BrokenFirestore())
 
-    assert asyncio.run(store.systemPromptFor(PROJECT)) == DEFAULT_SYSTEM_PROMPT
+    assert asyncio.run(store.systemPromptFor(PROJECT)) == defaultSystemPrompt()
 
 
 def testAFirestoreFailureIsNotCached(redis) -> None:
@@ -161,7 +158,7 @@ def testAFirestoreFailureIsNotCached(redis) -> None:
     to the cache: a two-second outage would otherwise hold this project on the
     wrong prompt for a full TTL, long after Firestore came back."""
     broken = PromptStore(redis=redis, firestore=BrokenFirestore())
-    assert asyncio.run(broken.systemPromptFor(PROJECT)) == DEFAULT_SYSTEM_PROMPT
+    assert asyncio.run(broken.systemPromptFor(PROJECT)) == defaultSystemPrompt()
 
     assert redis.get(broken.cacheKey(PROJECT)) is None
 
@@ -182,7 +179,7 @@ def testAProjectWithNoPromptIsCached(store: PromptStore, redis) -> None:
     for every project that never configures a prompt."""
     asyncio.run(store.systemPromptFor("never-configured"))
 
-    assert redis.get(store.cacheKey("never-configured")) == DEFAULT_SYSTEM_PROMPT
+    assert redis.get(store.cacheKey("never-configured")) == defaultSystemPrompt()
 
 
 def testARedisFailureFallsBackToFirestore(firestore) -> None:
@@ -204,7 +201,7 @@ def testWithNoFirestoreEveryProjectGetsTheDefault(redis) -> None:
     """Local runs without GCP_PROJECT_ID still answer."""
     store = PromptStore(redis=redis, firestore=None)
 
-    assert asyncio.run(store.systemPromptFor(PROJECT)) == DEFAULT_SYSTEM_PROMPT
+    assert asyncio.run(store.systemPromptFor(PROJECT)) == defaultSystemPrompt()
 
 
 def testAssigningAPromptInvalidatesImmediately(store: PromptStore, redis, firestore) -> None:

@@ -13,7 +13,11 @@ from app.agent.llmManager import LlmConfigError
 from app.agent.reviewer import ReviewOutcome
 from app.api import routes
 from app.main import app
-from app.stores.chatStore import ChatStoreError, FirestoreChatStore, getChatStore
+from app.stores.conversationStore import (
+    ConversationStoreError,
+    FirestoreConversationStore,
+    getConversationStore,
+)
 from app.stores.projectStore import FirestoreProjectStore, getProjectStore
 
 # The project every request in this module names. Rebound per test by the
@@ -41,15 +45,15 @@ def projectStore(projectId) -> Iterator[FirestoreProjectStore]:
 
 
 @pytest.fixture
-def chatStore(projectStore) -> FirestoreChatStore:
-    """The real chat store, overriding the lru_cached process-wide one.
+def conversationStore(projectStore) -> FirestoreConversationStore:
+    """The real conversation store, overriding the lru_cached process-wide one.
 
     No Redis in front: a cache hit would answer a read without Firestore, and
     a test asserting what was stored would then be asserting what was
     remembered.
     """
-    store = FirestoreChatStore(redis=None)
-    app.dependency_overrides[getChatStore] = lambda: store
+    store = FirestoreConversationStore(redis=None)
+    app.dependency_overrides[getConversationStore] = lambda: store
     return store
 
 
@@ -58,14 +62,14 @@ def plannedSearches() -> list[dict]:
     """What the stubbed agent should pretend its search tool retrieved.
 
     Appended to the route's ``searchLog`` exactly as the real tool would, which
-    is what lets these tests check that retrievals are stored on the chat
+    is what lets these tests check that retrievals are stored on the conversation
     without standing up a vector store.
     """
     return []
 
 
 @pytest.fixture
-def calls(monkeypatch, chatStore, plannedSearches) -> list[dict]:
+def calls(monkeypatch, conversationStore, plannedSearches) -> list[dict]:
     """Replace the agent with a recorder, and hand back what it was asked."""
     recorded: list[dict] = []
 
@@ -106,32 +110,35 @@ def testAQuestionGetsTheAgentsAnswer(client: TestClient) -> None:
     assert payload["answer"] == "Thirty days from purchase."
 
 
-def testAQuestionWithNoChatIdStartsOneAndReturnsIt(client: TestClient, chatStore) -> None:
-    """The only way a caller learns the id of a chat it did not name."""
+def testAQuestionWithNoConversationIdStartsOneAndReturnsIt(
+    client: TestClient, conversationStore
+) -> None:
+    """The only way a caller learns the id of a conversation it did not name."""
     response = client.post("/api/v1/query", json=body())
 
-    chatId = response.json()["chatId"]
-    assert chatId
-    assert asyncio.run(chatStore.loadWindow(PROJECT_ID, chatId)) is not None
+    conversationId = response.json()["conversationId"]
+    assert conversationId
+    assert asyncio.run(conversationStore.loadWindow(PROJECT_ID, conversationId)) is not None
 
 
-def testTheFirstTurnOfANewChatHasNoHistory(client: TestClient, calls) -> None:
+def testTheFirstTurnOfANewConversationHasNoHistory(client: TestClient, calls) -> None:
     client.post("/api/v1/query", json=body())
 
-    window = calls[0]["chatWindow"]
+    window = calls[0]["conversationWindow"]
     assert window.messages == []
     assert window.context == []
 
 
 def testAFollowUpIsGivenTheEarlierTurns(client: TestClient, calls) -> None:
     """The point of the whole mechanism: turn two can see turn one."""
-    chatId = client.post("/api/v1/query", json=body()).json()["chatId"]
+    conversationId = client.post("/api/v1/query", json=body()).json()["conversationId"]
 
     client.post(
-        "/api/v1/query", json=body(question="And for gift cards?", chatId=chatId)
+        "/api/v1/query",
+        json=body(question="And for gift cards?", conversationId=conversationId),
     )
 
-    window = calls[1]["chatWindow"]
+    window = calls[1]["conversationWindow"]
     assert [message.content for message in window.messages] == [
         "What is the refund window?",
         "Thirty days from purchase.",
@@ -145,11 +152,13 @@ def testRetrievedPassagesAreStoredAndReplayed(
     have to pay for the same vector search again."""
     plannedSearches.append({"query": "refund window", "passages": ["Refunds: 30 days."]})
 
-    chatId = client.post("/api/v1/query", json=body()).json()["chatId"]
+    conversationId = client.post("/api/v1/query", json=body()).json()["conversationId"]
     plannedSearches.clear()
-    client.post("/api/v1/query", json=body(question="Gift cards?", chatId=chatId))
+    client.post(
+        "/api/v1/query", json=body(question="Gift cards?", conversationId=conversationId)
+    )
 
-    context = calls[1]["chatWindow"].context
+    context = calls[1]["conversationWindow"].context
     assert [entry.query for entry in context] == ["refund window"]
     assert context[0].passages == ["Refunds: 30 days."]
 
@@ -161,68 +170,77 @@ def testASearchThatFoundNothingIsStillRecorded(
     rediscover on every follow-up."""
     plannedSearches.append({"query": "parental leave", "passages": []})
 
-    chatId = client.post("/api/v1/query", json=body()).json()["chatId"]
+    conversationId = client.post("/api/v1/query", json=body()).json()["conversationId"]
     plannedSearches.clear()
-    client.post("/api/v1/query", json=body(question="Anything?", chatId=chatId))
+    client.post(
+        "/api/v1/query", json=body(question="Anything?", conversationId=conversationId)
+    )
 
-    assert [entry.query for entry in calls[1]["chatWindow"].context] == ["parental leave"]
+    assert [entry.query for entry in calls[1]["conversationWindow"].context] == ["parental leave"]
 
 
-def testTheChatKeepsThePromptItStartedWith(client: TestClient, calls) -> None:
+def testTheConversationKeepsThePromptItStartedWith(client: TestClient, calls) -> None:
     """A prompt edited mid-conversation must not rewrite the instructions the
-    earlier answers were given under, so it is snapshotted onto the chat."""
-    from app.agent.promptStore import DEFAULT_SYSTEM_PROMPT
+    earlier answers were given under, so it is snapshotted onto the conversation."""
+    from app.promptConfig import defaultSystemPrompt
 
-    chatId = client.post("/api/v1/query", json=body()).json()["chatId"]
-    client.post("/api/v1/query", json=body(question="Again?", chatId=chatId))
+    conversationId = client.post("/api/v1/query", json=body()).json()["conversationId"]
+    client.post(
+        "/api/v1/query", json=body(question="Again?", conversationId=conversationId)
+    )
 
-    assert calls[1]["chatWindow"].systemPrompt == DEFAULT_SYSTEM_PROMPT
+    assert calls[1]["conversationWindow"].systemPrompt == defaultSystemPrompt()
 
 
-def testAnUnknownChatIdIsA404(client: TestClient) -> None:
-    """Not a new chat. A typo silently starting a fresh conversation looks, to
+def testAnUnknownConversationIdIsA404(client: TestClient) -> None:
+    """Not a new conversation. A typo silently starting a fresh conversation looks, to
     the caller, exactly like a model that has forgotten everything."""
-    response = client.post("/api/v1/query", json=body(chatId="does-not-exist"))
+    response = client.post("/api/v1/query", json=body(conversationId="does-not-exist"))
 
     assert response.status_code == 404
 
 
-def testAChatIsScopedToItsProject(client: TestClient, scratch) -> None:
-    chatId = client.post("/api/v1/query", json=body()).json()["chatId"]
+def testAConversationIsScopedToItsProject(client: TestClient, scratch) -> None:
+    conversationId = client.post("/api/v1/query", json=body()).json()["conversationId"]
 
     response = client.post(
-        "/api/v1/query", json=body(projectId=scratch.projectId("other"), chatId=chatId)
+        "/api/v1/query",
+        json=body(projectId=scratch.projectId("other"), conversationId=conversationId),
     )
 
     assert response.status_code == 404
 
 
-def testAnUnreachableChatStoreStillAnswers(client: TestClient, monkeypatch, chatStore) -> None:
+def testAnUnreachableConversationStoreStillAnswers(
+    client: TestClient, monkeypatch, conversationStore
+) -> None:
     """The model call is the expensive, irreversible step. A conversation that
     could not be loaded is a reason for a worse answer, not for no answer."""
 
     async def unreachable(*args, **kwargs):
-        raise ChatStoreError("Firestore is down")
+        raise ConversationStoreError("Firestore is down")
 
-    monkeypatch.setattr(chatStore, "loadWindow", unreachable)
-    chatId = "some-chat"
+    monkeypatch.setattr(conversationStore, "loadWindow", unreachable)
+    conversationId = "some-conversation"
 
-    response = client.post("/api/v1/query", json=body(chatId=chatId))
+    response = client.post("/api/v1/query", json=body(conversationId=conversationId))
 
     assert response.status_code == 200
-    # The caller's own id comes back: their chat still exists, this one turn
+    # The caller's own id comes back: their conversation still exists, this one turn
     # simply did not reach it.
-    assert response.json()["chatId"] == chatId
+    assert response.json()["conversationId"] == conversationId
 
 
-def testAFailedWriteDoesNotLoseTheAnswer(client: TestClient, monkeypatch, chatStore) -> None:
+def testAFailedWriteDoesNotLoseTheAnswer(
+    client: TestClient, monkeypatch, conversationStore
+) -> None:
     """The answer is already paid for. Losing it because history could not be
     written is a strictly worse outcome than losing the history."""
 
     async def broken(**kwargs):
-        raise ChatStoreError("write failed")
+        raise ConversationStoreError("write failed")
 
-    monkeypatch.setattr(chatStore, "appendTurn", broken)
+    monkeypatch.setattr(conversationStore, "appendTurn", broken)
 
     response = client.post("/api/v1/query", json=body())
 

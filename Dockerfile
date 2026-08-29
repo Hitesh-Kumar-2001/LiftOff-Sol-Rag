@@ -56,6 +56,24 @@ RUN uv run python docker/checkRarBackend.py
 COPY app ./app
 COPY scripts ./scripts
 
+# models.toml (which model answers, grades, summarises and chunks) and
+# prompts.toml (who the agent is). app/modelConfig.py and app/promptConfig.py
+# locate these relative to the package rather than the working directory -- app/
+# sits at /app/app here, so config/ has to be at /app/config for that to
+# resolve, which is exactly where this puts it.
+#
+# Without models.toml the image starts and dies in checkConfiguration with "no
+# model is configured for agent", which is at least a loud failure rather than a
+# 503 per request. Without prompts.toml it starts and serves the built-in
+# fallback prompt, which is quieter and worse: the service answers as a plain
+# assistant instead of as the persona somebody configured, and nothing looks
+# wrong until a transcript is read.
+#
+# A deployment that wants different models or a different persona without a
+# rebuild sets RAG_*_PROVIDER / RAG_*_MODEL or RAG_PERSONA; those win over these
+# files.
+COPY config ./config
+
 # FastAPI
 EXPOSE 8000
 

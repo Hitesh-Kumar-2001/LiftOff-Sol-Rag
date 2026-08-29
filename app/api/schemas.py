@@ -31,19 +31,87 @@ class QueryRequest(CamelModel):
     question: str = Field(min_length=1, max_length=4000)
     project_id: str = Field(min_length=1, max_length=128)
     # The conversation this question belongs to. Absent means "start one", and
-    # the id of the new chat comes back on the response. A chatId that does not
-    # exist is a 404 rather than a new chat: a typo silently opening a fresh
-    # conversation is the one failure a caller cannot see, because it looks
-    # exactly like a model that has forgotten everything.
-    chat_id: str | None = Field(default=None, min_length=1, max_length=128)
+    # the id of the new conversation comes back on the response. An id that does
+    # not exist is a 404 rather than a new conversation: a typo silently opening
+    # a fresh one is the failure a caller cannot see, because it looks exactly
+    # like a model that has forgotten everything.
+    #
+    # `chatId` was briefly accepted here as an input alias while the storage
+    # layer still said "chat". It is not any more: the word is gone from the
+    # whole service, and `extra="forbid"` means a caller still sending it gets a
+    # 422 naming the field rather than a 200 for a question that quietly started
+    # a new conversation -- which is the same failure this endpoint 404s for.
+    conversation_id: str | None = Field(default=None, min_length=1, max_length=128)
 
 
 class QueryResponse(CamelModel):
     answer: str
     project_id: str
     # Always returned, including on the turn that created it -- it is the only
-    # way a caller learns the id of a chat it did not name.
-    chat_id: str | None = None
+    # way a caller learns the id of a conversation it did not name.
+    conversation_id: str | None = None
+
+
+class ConversationCreateRequest(CamelModel):
+    model_config = ConfigDict(
+        alias_generator=to_camel,
+        populate_by_name=True,
+        extra="forbid",
+    )
+
+    server_id: str = Field(min_length=1, max_length=128)
+    # The project this conversation belongs to. Conversations are keyed by
+    # projectId and never by the ragDbId behind it: a project's first
+    # conversation can start before anything has been ingested, and a ragDbId is
+    # deliberately allowed to change, which would orphan every conversation
+    # keyed on it.
+    project_id: str = Field(min_length=1, max_length=128)
+    # Optional, and optional for a reason: left empty, the first question asked
+    # here becomes the title (see FirestoreConversationStore._appendTurn). A caller that
+    # has a name for the conversation up front -- a UI where the user typed one
+    # -- can say so instead.
+    title: str = Field(default="", max_length=200)
+
+
+class ConversationCreateResponse(CamelModel):
+    """The conversation that now exists, and the id every later turn names.
+
+    ``systemPrompt`` is the project's prompt as it stood at this moment,
+    snapshotted onto the conversation. It is returned because it is the
+    substantive thing this call decided: the conversation will answer under
+    these instructions for its whole life, even if the project's prompt is
+    edited tomorrow, and a caller cannot otherwise see which one it got.
+    """
+
+    conversation_id: str
+    project_id: str
+    system_prompt: str
+
+
+class ConversationMessageRequest(CamelModel):
+    """A question posted to a conversation that already exists."""
+
+    model_config = ConfigDict(
+        alias_generator=to_camel,
+        populate_by_name=True,
+        extra="forbid",
+    )
+
+    server_id: str = Field(min_length=1, max_length=128)
+    project_id: str = Field(min_length=1, max_length=128)
+    # Required here, unlike on /query. That is the entire difference between the
+    # two endpoints: this one addresses a conversation that exists, so an id
+    # that does not resolve is a 404 and never a new conversation.
+    conversation_id: str = Field(min_length=1, max_length=128)
+    question: str = Field(min_length=1, max_length=4000)
+
+
+class ConversationMessageResponse(CamelModel):
+    answer: str
+    project_id: str
+    # Echoed back, so a caller can compare it with what it sent. They differ
+    # only in the degraded case where the conversation store could not be reached.
+    conversation_id: str
 
 
 class DocumentIngestRequest(CamelModel):

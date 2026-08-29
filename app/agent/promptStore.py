@@ -24,10 +24,14 @@ first's invalidation, and an operator editing a prompt would have to guess how
 many processes were holding a stale copy and restart each of them.
 
 Only a prompt that was actually *resolved* is cached. Every failure here still
-answers with ``DEFAULT_SYSTEM_PROMPT`` -- a prompt lookup must not fail a
-question -- but a default that stood in for an unreachable Firestore is never
-written to the cache, or a momentary outage would hold a project on the wrong
-prompt for a full TTL.
+answers with the default -- a prompt lookup must not fail a question -- but a
+default that stood in for an unreachable Firestore is never written to the
+cache, or a momentary outage would hold a project on the wrong prompt for a
+full TTL.
+
+What the *default* is comes from ``app.promptConfig``: the persona selected in
+``config/prompts.toml``. This module is the per-project layer on top of it, and
+a project with a prompt assigned in Firestore never reaches that file at all.
 """
 
 from __future__ import annotations
@@ -37,6 +41,8 @@ import logging
 import os
 
 from redis import Redis
+
+from app.promptConfig import defaultSystemPrompt
 
 logger = logging.getLogger(__name__)
 
@@ -51,17 +57,14 @@ CACHE_PREFIX = os.environ.get("RAG_PROMPT_CACHE_PREFIX", "ragPrompt:")
 # the window in which an edited prompt is still answered with the old text.
 PROMPT_TTL_SECONDS = int(os.environ.get("RAG_PROMPT_TTL_SECONDS", 3600))
 
-# Answers a project that has never been given a prompt of its own. Without it
-# every new project would fail its first question, which is a poor introduction
-# to the service.
-DEFAULT_SYSTEM_PROMPT = os.environ.get("RAG_DEFAULT_SYSTEM_PROMPT") or (
-    "You are a retrieval-grounded assistant for one project's documents.\n"
-    "Answer from what the project's own documents say. Use the searchProject "
-    "tool to find them before answering anything factual -- do not answer from "
-    "memory when the answer should come from the documents.\n"
-    "If the documents do not contain the answer, say so plainly rather than "
-    "guessing, and say what they do cover. Keep answers direct and specific."
-)
+# The prompt a project with none of its own answers with lives in
+# config/prompts.toml and is read through ``defaultSystemPrompt()``. It used to
+# be a module constant here, which meant two things that both turned out to be
+# wrong: the text was frozen at import, so a persona could not be changed
+# without a restart, and the pitch a business owns lived in a Python file.
+#
+# Called rather than bound to a name at import for the first of those reasons --
+# see the note on _configPath in app.modelConfig for the same footgun.
 
 
 class PromptStore:
@@ -79,9 +82,9 @@ class PromptStore:
     async def systemPromptFor(self, projectId: str) -> str:
         """The prompt this project answers with.
 
-        Falls back to ``DEFAULT_SYSTEM_PROMPT`` when the project has no prompt
-        assigned, or when the id it is assigned no longer exists -- a dangling
-        assignment should degrade to a working assistant, not a 500.
+        Falls back to the configured persona's prompt when the project has no
+        prompt assigned, or when the id it is assigned no longer exists -- a
+        dangling assignment should degrade to a working assistant, not a 500.
         """
         cached = await self._cacheGet(projectId)
         if cached is not None:
@@ -93,7 +96,7 @@ class PromptStore:
             # *caching* it is not -- a two-second outage would otherwise pin the
             # default onto this project for the next PROMPT_TTL_SECONDS, so a
             # blip nobody noticed would quietly cost an hour of wrong prompts.
-            return DEFAULT_SYSTEM_PROMPT
+            return defaultSystemPrompt()
 
         await self._cacheSet(projectId, resolved)
         return resolved
@@ -106,7 +109,7 @@ class PromptStore:
         the default and is worth caching; see the caller.
         """
         if self._firestore is None:
-            return DEFAULT_SYSTEM_PROMPT
+            return defaultSystemPrompt()
 
         try:
             assignment = (
@@ -115,11 +118,11 @@ class PromptStore:
                 .get()
             )
             if not assignment.exists:
-                return DEFAULT_SYSTEM_PROMPT
+                return defaultSystemPrompt()
 
             promptId = (assignment.to_dict() or {}).get("promptId")
             if not promptId:
-                return DEFAULT_SYSTEM_PROMPT
+                return defaultSystemPrompt()
 
             document = (
                 self._firestore.collection(PROMPT_COLLECTION).document(promptId).get()
@@ -130,9 +133,9 @@ class PromptStore:
                     projectId,
                     promptId,
                 )
-                return DEFAULT_SYSTEM_PROMPT
+                return defaultSystemPrompt()
 
-            return (document.to_dict() or {}).get("prompt") or DEFAULT_SYSTEM_PROMPT
+            return (document.to_dict() or {}).get("prompt") or defaultSystemPrompt()
         except Exception:
             # A prompt lookup failing should not fail the question. The default
             # prompt still produces a grounded answer; a 500 produces nothing.

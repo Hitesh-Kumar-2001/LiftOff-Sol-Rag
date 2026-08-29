@@ -22,18 +22,18 @@ from app.agent.summariser import (
     summariseConversation,
     trimToBudget,
 )
-from app.stores.chatStore import ChatMessage, ChatWindow, ContextEntry
+from app.stores.conversationStore import ConversationMessage, ConversationWindow, ContextEntry
 
 PROJECT = "handbook"
 
 
-def window(**overrides) -> ChatWindow:
+def window(**overrides) -> ConversationWindow:
     base = {
-        "chatId": "c1",
+        "conversationId": "c1",
         "projectId": PROJECT,
         "systemPrompt": "You are the handbook assistant.",
     }
-    return ChatWindow(**(base | overrides))
+    return ConversationWindow(**(base | overrides))
 
 
 # --- rendering -------------------------------------------------------------
@@ -41,7 +41,7 @@ def window(**overrides) -> ChatWindow:
 
 def testAnEmptyConversationRendersNothing() -> None:
     """A first turn must look exactly like a single-turn question did before
-    chats existed -- no empty scaffolding in the prompt."""
+    conversations existed -- no empty scaffolding in the prompt."""
     assert renderContext(window()) == ""
     assert renderHistory(window()) == []
 
@@ -88,9 +88,9 @@ def testHistoryComesBackInTurnOrder() -> None:
     rendered = renderHistory(
         window(
             messages=[
-                ChatMessage(2, "user", "second question"),
-                ChatMessage(0, "user", "first question"),
-                ChatMessage(1, "assistant", "first answer"),
+                ConversationMessage(2, "user", "second question"),
+                ConversationMessage(0, "user", "first question"),
+                ConversationMessage(1, "assistant", "first answer"),
             ]
         )
     )
@@ -106,7 +106,13 @@ def testHistoryCarriesNoGrades() -> None:
     """Telling a model its earlier answer scored 0.4 invites it to apologise
     for that answer instead of answering the question in front of it."""
     rendered = renderHistory(
-        window(messages=[ChatMessage(0, "assistant", "an answer", reviewScore=0.4, retried=True)])
+        window(
+            messages=[
+                ConversationMessage(
+                    0, "assistant", "an answer", reviewScore=0.4, retried=True
+                )
+            ]
+        )
     )
 
     assert rendered == [{"role": "assistant", "content": "an answer"}]
@@ -114,7 +120,12 @@ def testHistoryCarriesNoGrades() -> None:
 
 def testEmptyMessagesAreDropped() -> None:
     rendered = renderHistory(
-        window(messages=[ChatMessage(0, "user", "  "), ChatMessage(1, "assistant", "real")])
+        window(
+            messages=[
+                ConversationMessage(0, "user", "  "),
+                ConversationMessage(1, "assistant", "real"),
+            ]
+        )
     )
 
     assert [message["content"] for message in rendered] == ["real"]
@@ -124,7 +135,7 @@ def testEmptyMessagesAreDropped() -> None:
 
 
 def testASmallConversationIsLeftAlone() -> None:
-    assert not needsSummary(window(messages=[ChatMessage(0, "user", "short")], turnCount=2))
+    assert not needsSummary(window(messages=[ConversationMessage(0, "user", "short")], turnCount=2))
 
 
 def testAnOversizedConversationIsFolded() -> None:
@@ -133,7 +144,7 @@ def testAnOversizedConversationIsFolded() -> None:
     assert needsSummary(
         window(
             turnCount=10,
-            messages=[ChatMessage(index, "user", big) for index in range(10)],
+            messages=[ConversationMessage(index, "user", big) for index in range(10)],
         )
     )
 
@@ -145,7 +156,13 @@ def testOneEnormousExchangeIsNotWorthFolding() -> None:
     big = "x" * (summariser.SUMMARY_TRIGGER_TOKENS * summariser.CHARS_PER_TOKEN + 1)
 
     assert not needsSummary(
-        window(turnCount=2, messages=[ChatMessage(0, "user", big), ChatMessage(1, "assistant", big)])
+        window(
+            turnCount=2,
+            messages=[
+                ConversationMessage(0, "user", big),
+                ConversationMessage(1, "assistant", big),
+            ],
+        )
     )
 
 
@@ -165,7 +182,7 @@ def testTheRecentTurnsSurviveTheFold() -> None:
     folded = applySummary(
         window(
             turnCount=10,
-            messages=[ChatMessage(index, "user", f"turn {index}") for index in range(10)],
+            messages=[ConversationMessage(index, "user", f"turn {index}") for index in range(10)],
         ),
         summary="earlier",
         throughTurn=6,
@@ -191,7 +208,10 @@ def testFoldingDropsTheContextItCovers() -> None:
 
 
 def testAFoldedWindowIsACopy() -> None:
-    original = window(turnCount=6, messages=[ChatMessage(index, "user", "t") for index in range(6)])
+    original = window(
+        turnCount=6,
+        messages=[ConversationMessage(index, "user", "t") for index in range(6)],
+    )
 
     applySummary(original, summary="s", throughTurn=4, throughContext=0)
 
@@ -212,7 +232,10 @@ def testTheSummariserFoldsTheOldTurnsIntoProse() -> None:
         summariseConversation(
             window(
                 turnCount=10,
-                messages=[ChatMessage(index, "user", f"turn {index}") for index in range(10)],
+                messages=[
+                    ConversationMessage(index, "user", f"turn {index}")
+                    for index in range(10)
+                ],
             ),
             model=model,
         )
@@ -237,7 +260,10 @@ def testABrokenSummariserIsNotAnError() -> None:
 
     result = asyncio.run(
         summariseConversation(
-            window(turnCount=10, messages=[ChatMessage(i, "user", f"t{i}") for i in range(10)]),
+            window(
+                turnCount=10,
+                messages=[ConversationMessage(i, "user", f"t{i}") for i in range(10)],
+            ),
             model=BrokenModel(),
         )
     )
@@ -245,7 +271,7 @@ def testABrokenSummariserIsNotAnError() -> None:
     assert result is None
 
 
-def testThereIsNothingToFoldInAFreshChat() -> None:
+def testThereIsNothingToFoldInAFreshConversation() -> None:
     class Unused:
         async def ainvoke(self, messages):  # pragma: no cover - must not be called
             raise AssertionError("The summariser was called with nothing to summarise.")
@@ -277,7 +303,7 @@ def testTrimmingNeverDropsAMessage() -> None:
     """Passages can be searched for again; a missing turn silently rewrites the
     conversation the user can see they had."""
     big = "w" * (summariser.SUMMARY_TRIGGER_TOKENS * summariser.CHARS_PER_TOKEN)
-    oversized = window(turnCount=2, messages=[ChatMessage(0, "user", big)])
+    oversized = window(turnCount=2, messages=[ConversationMessage(0, "user", big)])
 
     assert len(trimToBudget(oversized).messages) == 1
 

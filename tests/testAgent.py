@@ -261,6 +261,9 @@ class RecordingModel(BaseChatModel):
     def _get_ls_params(self, stop=None, **kwargs):
         # How deepagents decides which harness profile applies to a pre-built
         # model. The provider name, not the class, is what it keys on.
+        # "chat" here is LangChain's own vocabulary for a chat *model*, not this
+        # service's conversations -- it is not part of the chat -> conversation
+        # rename and must stay as the library spells it.
         return {"ls_provider": self.provider, "ls_model_name": "test", "ls_model_type": "chat"}
 
     def bind_tools(self, tools, **kwargs):

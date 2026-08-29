@@ -12,7 +12,7 @@ this tool.
 
 It also closes over an optional ``searchLog``, which is how a retrieval survives
 the request that made it: what the tool found is appended there, and the route
-stores it on the chat so a follow-up is answered from the passages rather than
+stores it on the conversation so a follow-up is answered from the passages rather than
 by searching for them again. That is a second closed-over value and *not* a
 second tool argument -- the model's view of this tool stays exactly one string
 in, one string out, which is what ``tests/testAgent.py`` pins.
@@ -40,7 +40,7 @@ def buildProjectSearchTool(store, ragDbId: str, searchLog: list[dict] | None = N
     """A retrieval tool bound to one project's database.
 
     ``searchLog`` collects ``{"query", "passages"}`` for every search that
-    reached the store, so the caller can persist them onto the chat. None means
+    reached the store, so the caller can persist them onto the conversation. None means
     nobody is recording -- the tool behaves identically either way.
     """
 
@@ -117,7 +117,7 @@ def buildTools(
     keep trying it.
 
     ``searchLog`` is passed to the project search tool only. Web results are
-    deliberately not recorded onto a chat: they are somebody else's pages,
+    deliberately not recorded onto a conversation: they are somebody else's pages,
     they go stale, and re-fetching one is a Tavily call rather than the vector
     search this mechanism exists to avoid paying for twice.
     """

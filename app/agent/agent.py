@@ -5,15 +5,15 @@
                                                       +--- retry ----+  (at most once)
 
 The agent is a `deepagents` deep agent given three things the base harness does
-not have: a search tool bound to this project's documents, this chat's system
+not have: a search tool bound to this project's documents, this conversation's system
 prompt, and whatever the conversation has already established. Whether to
 search, how many times, and with what wording are the model's decisions -- there
 is no forced retrieval step, because a follow-up like "say that more briefly"
 should not cost a vector search.
 
-The conversation arrives as a ``ChatWindow`` and leaves as an entry in
+The conversation arrives as a ``ConversationWindow`` and leaves as an entry in
 ``searchLog``; neither is loaded or stored here. This module answers one
-question -- ``app.api.routes.query`` owns the chat around it, because durability
+question -- ``app.api.routes.query`` owns the conversation around it, because durability
 is not the agent's concern and a failure to write history must not lose an
 answer that was already paid for.
 
@@ -42,7 +42,7 @@ from app.agent.reviewer import (
 )
 from app.agent.summariser import renderContext, renderHistory
 from app.agent.tools import buildTools
-from app.stores.chatStore import ChatWindow
+from app.stores.conversationStore import ConversationWindow
 
 logger = logging.getLogger(__name__)
 
@@ -180,7 +180,7 @@ async def answerQuestion(
     ragDbId: str | None,
     chunkStore,
     promptStore=None,
-    chatWindow: ChatWindow | None = None,
+    conversationWindow: ConversationWindow | None = None,
     searchLog: list[dict] | None = None,
 ) -> AgentAnswer:
     """Answer ``question`` for ``projectId``, reviewing the result once.
@@ -189,10 +189,10 @@ async def answerQuestion(
     agent still runs -- it can answer from the system prompt, the conversation,
     or web search -- it just gets no retrieval tool. See ``buildTools``.
 
-    ``chatWindow`` is the conversation this question belongs to: its prompt, the
+    ``conversationWindow`` is the conversation this question belongs to: its prompt, the
     passages it has already retrieved, and its previous turns. None is a
-    single-turn question, which is what every question was before chats existed
-    and still what a caller sending no ``chatId`` gets.
+    single-turn question, which is what every question was before conversations existed
+    and still what a caller sending no ``conversationId`` gets.
 
     ``searchLog`` is where this turn's retrievals are recorded for the caller to
     store. Passed in rather than returned because this function's return value
@@ -200,26 +200,26 @@ async def answerQuestion(
     """
     prompts = promptStore or getPromptStore()
 
-    # A chat answers with the prompt it was created under, not the project's
+    # A conversation answers with the prompt it was created under, not the project's
     # current one. Re-resolving per turn would let an edit rewrite the
     # instructions mid-conversation, leaving the model bound to earlier answers
-    # it would no longer have given. See app.stores.chatStore.
+    # it would no longer have given. See app.stores.conversationStore.
     systemPrompt = (
-        chatWindow.systemPrompt
-        if chatWindow is not None and chatWindow.systemPrompt
+        conversationWindow.systemPrompt
+        if conversationWindow is not None and conversationWindow.systemPrompt
         else await prompts.systemPromptFor(projectId)
     )
 
     # Retrieved passages ride in the system prompt rather than as replayed tool
     # calls -- see app.agent.summariser for why. The effect is that a follow-up
     # starts already holding what the conversation has found.
-    if chatWindow is not None:
-        systemPrompt += renderContext(chatWindow)
+    if conversationWindow is not None:
+        systemPrompt += renderContext(conversationWindow)
 
     tools = buildTools(chunkStore, ragDbId, searchLog)
     agent = buildAgent(systemPrompt, tools)
 
-    history = renderHistory(chatWindow) if chatWindow is not None else []
+    history = renderHistory(conversationWindow) if conversationWindow is not None else []
     messages = [*history, {"role": "user", "content": question}]
     answer, transcript = await _run(agent, messages)
 

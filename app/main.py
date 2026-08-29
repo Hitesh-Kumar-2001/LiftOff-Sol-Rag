@@ -10,8 +10,10 @@ from app.api.routes import router
 from app.api.schemas import HealthResponse
 from app.infra.machineStats import machineStats, primeCpuPercent
 from app.jobs.jobManager import getJobManager
-from app.stores.chatStore import getChatStore
+from app.modelConfig import configuredModels, describeModels
+from app.promptConfig import describePersona, validatePersona
 from app.stores.chunkStoreFactory import getChunkStore
+from app.stores.conversationStore import getConversationStore
 from app.stores.projectStore import getProjectStore
 
 logger = logging.getLogger(__name__)
@@ -42,7 +44,7 @@ def checkConfiguration() -> None:
     taking the process down. See ``app.api.routes``.
     """
     getProjectStore()
-    getChatStore()
+    getConversationStore()
     getChunkStore()
     # Also a configuration question rather than a connectivity one: is
     # REDIS_URL set, and is it set alongside the GCP project durable jobs need
@@ -50,6 +52,28 @@ def checkConfiguration() -> None:
     # app.jobs.jobManager -- which routes.py does for the exception types --
     # does not itself require a working environment.
     getJobManager()
+
+    # Which model answers, grades, summarises and chunks. Also configuration
+    # rather than connectivity: it reads config/models.toml and the environment
+    # and resolves four (provider, model) pairs without calling a vendor.
+    #
+    # Worth failing the deployment over because the alternative is a service
+    # that starts, passes its health check, and 503s every /query -- and worse,
+    # ingests happily until the first document large enough to need AI chunking,
+    # which then fails hours later on a worker nobody is watching. A missing
+    # [chunker] section is a five-second fix at deploy time and a bad afternoon
+    # if it is found by a job.
+    configuredModels()
+    logger.info("Models in use:\n%s", describeModels())
+
+    # Who the agent is. Raises on a RAG_PERSONA naming a persona that does not
+    # exist, which is the failure worth catching at startup because it is
+    # otherwise silent: the service answers perfectly well, as somebody other
+    # than the assistant that was configured, and nobody finds out until they
+    # read a transcript. A *missing* file is not fatal -- promptConfig falls back
+    # to a built-in prompt, because a worse assistant beats no assistant.
+    validatePersona()
+    logger.info("Persona: %s", describePersona())
 
 
 @asynccontextmanager
