@@ -1,6 +1,12 @@
-"""The /query route. The agent itself is stubbed -- what this covers is the
-route's contract: validation, what it hands the agent, and what it does when
-the agent cannot run at all. The loop inside is tests/testAgent.py."""
+"""The `web` gateway: POST /api/v1/conversations/{projectId}/web.
+
+The browser-facing half of the single conversation route -- a question in the
+body, the answer on the response. The webhook gateways are the other half and
+are in tests/testChannelRoutes.py; all three run the same `runTurn`, so what is
+covered here is the part only this gateway has: body validation, and what a
+caller sees when the agent cannot run at all.
+
+The agent itself is stubbed. The loop inside it is tests/testAgent.py."""
 
 import asyncio
 from collections.abc import Iterator
@@ -11,7 +17,7 @@ from fastapi.testclient import TestClient
 from app.agent.agent import AgentAnswer
 from app.agent.llmManager import LlmConfigError
 from app.agent.reviewer import ReviewOutcome
-from app.api import routes
+from app.api import conversationRoutes
 from app.main import app
 from app.stores.conversationStore import (
     ConversationStoreError,
@@ -82,7 +88,7 @@ def calls(monkeypatch, conversationStore, plannedSearches) -> list[dict]:
             reviewOutcome=ReviewOutcome(score=0.9, suggestion="", retried=False),
         )
 
-    monkeypatch.setattr(routes, "answerQuestion", fakeAnswer)
+    monkeypatch.setattr(conversationRoutes, "answerQuestion", fakeAnswer)
     return recorded
 
 
@@ -92,17 +98,23 @@ def client(calls) -> Iterator[TestClient]:
         yield testClient
 
 
+def webUrl(projectId: str | None = None) -> str:
+    """Where a browser posts a question. The project is in the path now, so a
+    test that wants a different project builds a different URL rather than
+    overriding a body field."""
+    return f"/api/v1/conversations/{projectId or PROJECT_ID}/web"
+
+
 def body(**overrides: str) -> dict[str, str]:
     payload = {
         "serverId": "billing-service",
         "question": "What is the refund window?",
-        "projectId": PROJECT_ID,
     }
     return payload | overrides
 
 
 def testAQuestionGetsTheAgentsAnswer(client: TestClient) -> None:
-    response = client.post("/api/v1/query", json=body())
+    response = client.post(webUrl(), json=body())
 
     assert response.status_code == 200
     payload = response.json()
@@ -114,7 +126,7 @@ def testAQuestionWithNoConversationIdStartsOneAndReturnsIt(
     client: TestClient, conversationStore
 ) -> None:
     """The only way a caller learns the id of a conversation it did not name."""
-    response = client.post("/api/v1/query", json=body())
+    response = client.post(webUrl(), json=body())
 
     conversationId = response.json()["conversationId"]
     assert conversationId
@@ -122,7 +134,7 @@ def testAQuestionWithNoConversationIdStartsOneAndReturnsIt(
 
 
 def testTheFirstTurnOfANewConversationHasNoHistory(client: TestClient, calls) -> None:
-    client.post("/api/v1/query", json=body())
+    client.post(webUrl(), json=body())
 
     window = calls[0]["conversationWindow"]
     assert window.messages == []
@@ -131,10 +143,10 @@ def testTheFirstTurnOfANewConversationHasNoHistory(client: TestClient, calls) ->
 
 def testAFollowUpIsGivenTheEarlierTurns(client: TestClient, calls) -> None:
     """The point of the whole mechanism: turn two can see turn one."""
-    conversationId = client.post("/api/v1/query", json=body()).json()["conversationId"]
+    conversationId = client.post(webUrl(), json=body()).json()["conversationId"]
 
     client.post(
-        "/api/v1/query",
+        webUrl(),
         json=body(question="And for gift cards?", conversationId=conversationId),
     )
 
@@ -152,10 +164,10 @@ def testRetrievedPassagesAreStoredAndReplayed(
     have to pay for the same vector search again."""
     plannedSearches.append({"query": "refund window", "passages": ["Refunds: 30 days."]})
 
-    conversationId = client.post("/api/v1/query", json=body()).json()["conversationId"]
+    conversationId = client.post(webUrl(), json=body()).json()["conversationId"]
     plannedSearches.clear()
     client.post(
-        "/api/v1/query", json=body(question="Gift cards?", conversationId=conversationId)
+        webUrl(), json=body(question="Gift cards?", conversationId=conversationId)
     )
 
     context = calls[1]["conversationWindow"].context
@@ -170,10 +182,10 @@ def testASearchThatFoundNothingIsStillRecorded(
     rediscover on every follow-up."""
     plannedSearches.append({"query": "parental leave", "passages": []})
 
-    conversationId = client.post("/api/v1/query", json=body()).json()["conversationId"]
+    conversationId = client.post(webUrl(), json=body()).json()["conversationId"]
     plannedSearches.clear()
     client.post(
-        "/api/v1/query", json=body(question="Anything?", conversationId=conversationId)
+        webUrl(), json=body(question="Anything?", conversationId=conversationId)
     )
 
     assert [entry.query for entry in calls[1]["conversationWindow"].context] == ["parental leave"]
@@ -184,9 +196,9 @@ def testTheConversationKeepsThePromptItStartedWith(client: TestClient, calls) ->
     earlier answers were given under, so it is snapshotted onto the conversation."""
     from app.promptConfig import defaultSystemPrompt
 
-    conversationId = client.post("/api/v1/query", json=body()).json()["conversationId"]
+    conversationId = client.post(webUrl(), json=body()).json()["conversationId"]
     client.post(
-        "/api/v1/query", json=body(question="Again?", conversationId=conversationId)
+        webUrl(), json=body(question="Again?", conversationId=conversationId)
     )
 
     assert calls[1]["conversationWindow"].systemPrompt == defaultSystemPrompt()
@@ -195,17 +207,17 @@ def testTheConversationKeepsThePromptItStartedWith(client: TestClient, calls) ->
 def testAnUnknownConversationIdIsA404(client: TestClient) -> None:
     """Not a new conversation. A typo silently starting a fresh conversation looks, to
     the caller, exactly like a model that has forgotten everything."""
-    response = client.post("/api/v1/query", json=body(conversationId="does-not-exist"))
+    response = client.post(webUrl(), json=body(conversationId="does-not-exist"))
 
     assert response.status_code == 404
 
 
 def testAConversationIsScopedToItsProject(client: TestClient, scratch) -> None:
-    conversationId = client.post("/api/v1/query", json=body()).json()["conversationId"]
+    conversationId = client.post(webUrl(), json=body()).json()["conversationId"]
 
     response = client.post(
-        "/api/v1/query",
-        json=body(projectId=scratch.projectId("other"), conversationId=conversationId),
+        webUrl(scratch.projectId("other")),
+        json=body(conversationId=conversationId),
     )
 
     assert response.status_code == 404
@@ -223,7 +235,7 @@ def testAnUnreachableConversationStoreStillAnswers(
     monkeypatch.setattr(conversationStore, "loadWindow", unreachable)
     conversationId = "some-conversation"
 
-    response = client.post("/api/v1/query", json=body(conversationId=conversationId))
+    response = client.post(webUrl(), json=body(conversationId=conversationId))
 
     assert response.status_code == 200
     # The caller's own id comes back: their conversation still exists, this one turn
@@ -242,7 +254,7 @@ def testAFailedWriteDoesNotLoseTheAnswer(
 
     monkeypatch.setattr(conversationStore, "appendTurn", broken)
 
-    response = client.post("/api/v1/query", json=body())
+    response = client.post(webUrl(), json=body())
 
     assert response.status_code == 200
     assert response.json()["answer"] == "Thirty days from purchase."
@@ -252,7 +264,7 @@ def testTheAgentIsGivenTheProjectsDatabase(client: TestClient, calls, projectSto
     """Resolved here so the agent's search tool can be bound to it."""
     ragDbId = asyncio.run(projectStore.resolveOrCreate(PROJECT_ID))
 
-    client.post("/api/v1/query", json=body())
+    client.post(webUrl(), json=body())
 
     assert calls[0]["ragDbId"] == ragDbId
     assert calls[0]["projectId"] == PROJECT_ID
@@ -263,7 +275,7 @@ def testAnUningestedProjectStillAnswers(client: TestClient, calls, scratch) -> N
     """Asking a question does not create a database. The agent runs with no
     search tool rather than the request 404ing."""
     response = client.post(
-        "/api/v1/query", json=body(projectId=scratch.projectId("never-ingested"))
+        webUrl(scratch.projectId("never-ingested")), json=body()
     )
 
     assert response.status_code == 200
@@ -273,7 +285,7 @@ def testAnUningestedProjectStillAnswers(client: TestClient, calls, scratch) -> N
 def testQueryingDoesNotCreateADatabase(client: TestClient, projectStore, scratch) -> None:
     mistyped = scratch.projectId("mistyped")
 
-    client.post("/api/v1/query", json=body(projectId=mistyped))
+    client.post(webUrl(mistyped), json=body())
 
     assert asyncio.run(projectStore.resolve(mistyped)) is None
 
@@ -285,10 +297,10 @@ def testAnUnconfiguredAgentIsA503(monkeypatch, projectStore) -> None:
     async def unconfigured(**kwargs):
         raise LlmConfigError("ANTHROPIC_API_KEY is not set")
 
-    monkeypatch.setattr(routes, "answerQuestion", unconfigured)
+    monkeypatch.setattr(conversationRoutes, "answerQuestion", unconfigured)
 
     with TestClient(app) as client:
-        response = client.post("/api/v1/query", json=body())
+        response = client.post(webUrl(), json=body())
 
     assert response.status_code == 503
     assert "ANTHROPIC_API_KEY" in response.json()["detail"]
@@ -303,10 +315,10 @@ def testAProviderFailureIsA502(monkeypatch, projectStore) -> None:
     async def broken(**kwargs):
         raise RuntimeError("upstream 529: prompt was 'You are Acme's assistant'")
 
-    monkeypatch.setattr(routes, "answerQuestion", broken)
+    monkeypatch.setattr(conversationRoutes, "answerQuestion", broken)
 
     with TestClient(app) as client:
-        response = client.post("/api/v1/query", json=body())
+        response = client.post(webUrl(), json=body())
 
     assert response.status_code == 502
     assert "RuntimeError" in response.json()["detail"]
@@ -321,33 +333,33 @@ def testAnAgentThatNeverFinishesIsA504(monkeypatch, projectStore) -> None:
     async def hangs(**kwargs):
         await asyncio.sleep(30)
 
-    monkeypatch.setattr(routes, "answerQuestion", hangs)
-    monkeypatch.setattr(routes, "ANSWER_TIMEOUT_SECONDS", 0.05)
+    monkeypatch.setattr(conversationRoutes, "answerQuestion", hangs)
+    monkeypatch.setattr(conversationRoutes, "ANSWER_TIMEOUT_SECONDS", 0.05)
 
     with TestClient(app) as client:
-        response = client.post("/api/v1/query", json=body())
+        response = client.post(webUrl(), json=body())
 
     assert response.status_code == 504
 
 
-@pytest.mark.parametrize("field", ["serverId", "question", "projectId"])
+@pytest.mark.parametrize("field", ["serverId", "question"])
 def testEveryFieldIsRequired(client: TestClient, field: str) -> None:
     payload = body()
     del payload[field]
 
-    response = client.post("/api/v1/query", json=payload)
+    response = client.post(webUrl(), json=payload)
 
     assert response.status_code == 422
 
 
-@pytest.mark.parametrize("field", ["serverId", "question", "projectId"])
+@pytest.mark.parametrize("field", ["serverId", "question"])
 def testBlankFieldsAreRejected(client: TestClient, field: str) -> None:
-    response = client.post("/api/v1/query", json=body(**{field: ""}))
+    response = client.post(webUrl(), json=body(**{field: ""}))
 
     assert response.status_code == 422
 
 
 def testUnexpectedFieldsAreRejected(client: TestClient) -> None:
-    response = client.post("/api/v1/query", json=body(role="admin"))
+    response = client.post(webUrl(), json=body(role="admin"))
 
     assert response.status_code == 422

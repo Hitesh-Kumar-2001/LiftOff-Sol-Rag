@@ -64,16 +64,23 @@ somewhere else with `RAG_HEALTH_DISK_PATH`.
 
 ## Asking a question
 
-Two shapes, depending on who keeps the conversation id.
+One route, every gateway. The project is in the path; the last segment says how
+the question arrived and how the answer leaves:
 
-**One call.** `POST /api/v1/query` answers, and starts a conversation if none
-was named. The id comes back on the response and is what a follow-up sends:
+```
+POST /api/v1/conversations/{projectId}            start a conversation
+POST /api/v1/conversations/{projectId}/{gateway}  say something
+GET  /api/v1/conversations/{projectId}/{gateway}  the gateway's handshake
+```
+
+`gateway` is `web`, `whatsapp` or `line`.
+
+**web** — a question in the body, the answer on the response:
 
 ```json
 {
   "serverId": "billing-service",
   "question": "What is the refund window?",
-  "projectId": "handbook",
   "conversationId": "3f2a…"
 }
 ```
@@ -86,36 +93,55 @@ was named. The id comes back on the response and is what a follow-up sends:
 }
 ```
 
-**Two calls.** `POST /api/v1/conversation` creates an empty conversation and
-returns its `conversationId` and the system prompt snapshotted onto it (201);
-`POST /api/v1/conversation/message` then posts questions to it. Use this when
-the id is needed *before* there is a question — a UI opening a new conversation
-has a window to render and a record to attach to the user the moment the user
-clicks, and none of that can wait on a model call.
+Omit `conversationId` and one is started and returned. Send one this project does
+not have and it is a **404**, never a new conversation: a typo silently opening a
+fresh one looks, to the caller, exactly like a model that has forgotten
+everything. `POST /api/v1/conversations/{projectId}` starts an empty one when the
+id is needed before there is a question.
 
-`conversationId` is required on `/conversation/message`, and an id the project
-has no conversation for is a **404** rather than a new conversation: a typo
-silently starting a fresh one looks, to the caller, exactly like a model that
-has forgotten everything they said.
+**whatsapp / line** — the platform's own signed body. Paste the URL into the
+Meta app dashboard or the LINE Developers console. Every delivery is HMAC-checked
+against that project's signing secret before anything is parsed; a project with
+no secret configured is refused rather than trusted. The webhook is acknowledged
+with a 200 straight away and the answer is pushed back afterwards through the
+platform's API — these platforms redeliver anything slow or non-2xx, and
+answering takes far longer than they allow.
 
-What a conversation already knows is loaded **Redis first**, and rebuilt from
-Firestore only on a miss — see [docs/conversationSchema.md](docs/conversationSchema.md).
+Neither platform gives you a conversation id. They identify a *person* — a phone
+number on WhatsApp, a `userId` on LINE — and have no notion of a thread at all,
+so one is minted here and remembered against them under
+`ragChannels/{projectId}/threads`.
 
-| Status | Meaning |
-| ------ | ------- |
-| 200 | Answer returned |
-| 422 | A field is missing, blank, or unexpected |
-| 502 | The model provider failed. The request was fine; the failure is behind the API |
-| 503 | No model is configured — usually a missing or wrong API key |
-| 504 | The agent did not finish inside `RAG_ANSWER_TIMEOUT_SECONDS` |
+Adding another gateway is an adapter module implementing `Channel`
+(`verify` / `parse` / `send`) and one line in `app/channels/registry.py`. No route
+— the path is parameterised.
 
-`serverId` says *who is asking*, for the log and nothing else; `question` +
-`projectId` say *what to answer and from where*; `conversationId` says *which
-conversation it belongs to*.
+The document and search routes still take every id in the body. Nothing forced
+them into the path, and changing a working contract to match a constraint that
+does not apply to it would be churn.
 
-A 502's `detail` names the exception type and nothing else. Provider errors
-quote the prompt back, and the prompt is another project's configuration; the
-full error goes to the log instead.
+## What an answer cost
+
+Every answer runs three separately billed models -- the summariser (only when the
+conversation has outgrown its budget), the agent (several internal turns, and
+twice if the review fails), and the reviewer (every question). What each spent is
+recorded after the answer, under:
+
+```
+ragUsage/{projectId}                    the project's running total
+  conversations/{conversationId}        the conversation's total, by role
+    messages/{messageId}                one answered question
+```
+
+`messageId` is the assistant's turn index, so a usage row joins onto the message
+it paid for. Each row carries input/output/total tokens, cached-input and
+reasoning tokens (priced differently from the totals containing them), and which
+provider and model produced them. Rollups use Firestore `Increment`, so two
+answers in one conversation at the same moment both count.
+
+Nothing serves this over HTTP yet -- `projectTotal` and `conversationTotal` are
+on the store. Ingestion's own token cost is not recorded either, so a project's
+total is its answering cost only.
 
 ### How an answer is produced
 
@@ -450,6 +476,8 @@ Two things are known and accepted rather than fixed:
 | `TAVILY_API_KEY` | Enables web search. Unset, the agent simply never sees the tool. |
 | `RAG_AGENT_SEARCH_TOP_K` | Chunks per retrieval call. Default 6. |
 | `RAG_TAVILY_MAX_RESULTS` | Web results per search. Default 5. |
+| `FIRESTORE_CHANNELS_COLLECTION` | Where messaging gateway credentials live. Default `ragChannels`. |
+| `FIRESTORE_USAGE_COLLECTION` | Where token usage is recorded. Default `ragUsage`. |
 | `RAG_PERSONA` | Which persona in `config/prompts.toml` the agent is. Ships as `sales`; `support` is the neutral retrieval-grounded assistant. An unknown name fails startup. |
 | `RAG_PROMPT_CONFIG` | Where `config/prompts.toml` lives. |
 | `RAG_DEFAULT_SYSTEM_PROMPT` | A whole prompt, overriding the persona entirely. Suppresses its review criteria too. |

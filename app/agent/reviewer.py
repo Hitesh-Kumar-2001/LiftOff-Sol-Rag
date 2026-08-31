@@ -26,6 +26,7 @@ from dataclasses import dataclass
 from pydantic import BaseModel, Field
 
 from app.agent.llmManager import reviewerModel
+from app.agent.usage import trackUsage
 from app.promptConfig import reviewCriteria
 
 logger = logging.getLogger(__name__)
@@ -122,8 +123,13 @@ def retryInstruction(question: str, answer: str, suggestion: str) -> str:
     )
 
 
-async def review(question: str, answer: str, model=None) -> Review | None:
-    """Grade ``answer``. Returns None if grading could not run."""
+async def review(question: str, answer: str, model=None, usage=None) -> Review | None:
+    """Grade ``answer``. Returns None if grading could not run.
+
+    ``usage`` collects what this call cost. Structured output is why it has to
+    be a callback rather than a look at the return value -- see
+    ``app.agent.usage``.
+    """
     if not answer.strip():
         # Nothing to grade, and an empty answer is bad by definition -- say so
         # without paying for a model call.
@@ -131,15 +137,16 @@ async def review(question: str, answer: str, model=None) -> Review | None:
 
     try:
         judge = (model or reviewerModel()).with_structured_output(Review)
-        verdict = await judge.ainvoke(
-            [
-                {"role": "system", "content": reviewerSystemPrompt()},
-                {
-                    "role": "user",
-                    "content": f"Question:\n{question}\n\nDraft answer:\n{answer}",
-                },
-            ]
-        )
+        with trackUsage(usage, "reviewer"):
+            verdict = await judge.ainvoke(
+                [
+                    {"role": "system", "content": reviewerSystemPrompt()},
+                    {
+                        "role": "user",
+                        "content": f"Question:\n{question}\n\nDraft answer:\n{answer}",
+                    },
+                ]
+            )
     except Exception:
         logger.exception("The answer reviewer failed; returning the answer ungraded.")
         return None

@@ -81,8 +81,11 @@ class FirestoreScratch:
 
     def cleanup(self) -> None:
         from app.infra.firestoreClient import firestoreClient
+        from app.stores.channelStore import COLLECTION as CHANNELS
+        from app.stores.channelStore import THREADS
         from app.stores.conversationStore import COLLECTION as CONVERSATIONS
         from app.stores.projectStore import COLLECTION as PROJECTS
+        from app.stores.usageStore import COLLECTION as USAGE
 
         db = firestoreClient()
         for projectId in self.projectIds:
@@ -109,6 +112,30 @@ class FirestoreScratch:
                             document.reference.delete()
                     conversation.reference.delete()
                 db.collection(CONVERSATIONS).document(projectId).delete()
+            except Exception:
+                pass
+
+            try:
+                # Messaging gateway configuration, and the map from a platform
+                # user to their conversation. `threads` is a subcollection, so
+                # it outlives its parent unless it is walked as well.
+                channels = db.collection(CHANNELS).document(projectId)
+                for thread in channels.collection(THREADS).stream():
+                    thread.reference.delete()
+                channels.delete()
+            except Exception:
+                pass
+
+            try:
+                # Token accounting: project -> conversations -> messages, two
+                # subcollection levels that Firestore will not remove with the
+                # documents above them.
+                usage = db.collection(USAGE).document(projectId)
+                for conversation in usage.collection("conversations").stream():
+                    for message in conversation.reference.collection("messages").stream():
+                        message.reference.delete()
+                    conversation.reference.delete()
+                usage.delete()
             except Exception:
                 pass
 

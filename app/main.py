@@ -6,15 +6,18 @@ from fastapi import FastAPI, Request, status
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 
+from app.api.conversationRoutes import router as conversationRouter
 from app.api.routes import router
 from app.api.schemas import HealthResponse
 from app.infra.machineStats import machineStats, primeCpuPercent
 from app.jobs.jobManager import getJobManager
 from app.modelConfig import configuredModels, describeModels
 from app.promptConfig import describePersona, validatePersona
+from app.stores.channelStore import getChannelStore
 from app.stores.chunkStoreFactory import getChunkStore
 from app.stores.conversationStore import getConversationStore
 from app.stores.projectStore import getProjectStore
+from app.stores.usageStore import getUsageStore
 
 logger = logging.getLogger(__name__)
 
@@ -46,6 +49,15 @@ def checkConfiguration() -> None:
     getProjectStore()
     getConversationStore()
     getChunkStore()
+    # Where each project's messaging gateways and their credentials live.
+    # Same Firestore-or-nothing rule as the others: an in-process substitute
+    # would drop every gateway's credentials on restart and the deployment
+    # would come back up refusing every webhook while looking healthy.
+    getChannelStore()
+    # Where the token cost of every answer is written. Firestore-or-nothing
+    # for the same reason: a running total that resets on restart is not a
+    # cheaper running total, it is a wrong one.
+    getUsageStore()
     # Also a configuration question rather than a connectivity one: is
     # REDIS_URL set, and is it set alongside the GCP project durable jobs need
     # to be resolvable. Built here rather than at import so that importing
@@ -106,6 +118,11 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
 
 app = FastAPI(title="RAG API", version="0.1.0", lifespan=lifespan)
 app.include_router(router)
+# A separate router because it is a separate kind of endpoint: the project is in
+# the path rather than the body, one route serves every gateway, and the webhook
+# gateways are the only routes here that authenticate their caller. See
+# app.api.conversationRoutes.
+app.include_router(conversationRouter)
 
 
 @app.exception_handler(RequestValidationError)

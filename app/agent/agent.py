@@ -42,6 +42,7 @@ from app.agent.reviewer import (
 )
 from app.agent.summariser import renderContext, renderHistory
 from app.agent.tools import buildTools
+from app.agent.usage import UsageLog, trackUsage
 from app.stores.conversationStore import ConversationWindow
 
 logger = logging.getLogger(__name__)
@@ -162,14 +163,19 @@ def _lastText(result) -> str:
     return ""
 
 
-async def _run(agent, messages) -> tuple[str, list]:
+async def _run(agent, messages, usage: UsageLog | None = None) -> tuple[str, list]:
     """Run one turn. Returns the answer text and the full transcript.
 
     The transcript is what a retry continues from: it holds the tool calls and
     the passages they returned, so a second attempt does not have to search the
     project again to keep the part of the first answer that was already right.
+
+    The usage block wraps the whole graph run, so every internal turn and tool
+    round trip is counted -- there is no other way to see them, because
+    deepagents does not report what it spent.
     """
-    result = await agent.ainvoke({"messages": messages})
+    with trackUsage(usage, "agent"):
+        result = await agent.ainvoke({"messages": messages})
     return _lastText(result), list((result or {}).get("messages") or [])
 
 
@@ -182,6 +188,7 @@ async def answerQuestion(
     promptStore=None,
     conversationWindow: ConversationWindow | None = None,
     searchLog: list[dict] | None = None,
+    usage: UsageLog | None = None,
 ) -> AgentAnswer:
     """Answer ``question`` for ``projectId``, reviewing the result once.
 
@@ -197,6 +204,11 @@ async def answerQuestion(
     ``searchLog`` is where this turn's retrievals are recorded for the caller to
     store. Passed in rather than returned because this function's return value
     is the answer, and the tool fills the log while the graph is still running.
+
+    ``usage`` is the same idea for tokens: the agent, the reviewer and the retry
+    are three separately billed calls and only one of them is visible from the
+    outside, so what each cost is accumulated into it as they run. None means
+    nobody is counting, which is what every test that stubs a model gets.
     """
     prompts = promptStore or getPromptStore()
 
@@ -221,9 +233,9 @@ async def answerQuestion(
 
     history = renderHistory(conversationWindow) if conversationWindow is not None else []
     messages = [*history, {"role": "user", "content": question}]
-    answer, transcript = await _run(agent, messages)
+    answer, transcript = await _run(agent, messages, usage)
 
-    verdict = await review(question, answer)
+    verdict = await review(question, answer, usage=usage)
     if not needsAnotherAttempt(verdict):
         return AgentAnswer(
             answer=answer or NO_ANSWER,
@@ -249,7 +261,14 @@ async def answerQuestion(
     priorTurn = transcript or [*messages, {"role": "assistant", "content": answer}]
     retried, _ = await _run(
         agent,
-        [*priorTurn, {"role": "user", "content": retryInstruction(question, answer, verdict.suggestion)}],
+        [
+            *priorTurn,
+            {
+                "role": "user",
+                "content": retryInstruction(question, answer, verdict.suggestion),
+            },
+        ],
+        usage,
     )
 
     # Deliberately not reviewed again -- see app.agent.reviewer. If the second

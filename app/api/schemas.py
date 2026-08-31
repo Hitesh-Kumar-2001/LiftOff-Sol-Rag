@@ -10,8 +10,66 @@ secret, no signature, and no registry behind it, so it is a label the caller
 chose and not a claim the API can check. See the note in ``app.api.routes``.
 """
 
-from pydantic import BaseModel, ConfigDict, Field
+from typing import Annotated
+
+from pydantic import AfterValidator, BaseModel, ConfigDict, Field
 from pydantic.alias_generators import to_camel
+
+# A projectId becomes a Firestore document id, so it has to be one. Firestore
+# rejects an id that is longer than 1500 bytes, contains a slash, is exactly "."
+# or "..", or is wrapped in double underscores -- and it rejects them with an
+# InvalidArgument that escapes as a 500, several layers below the request that
+# caused it. Checking here turns every one of those into a 422 naming the field.
+#
+# 128 rather than Firestore's 1500 because this is an identifier a caller
+# chooses, not a payload: nothing legitimate is longer, and the cap is also what
+# keeps a pathological id out of a Redis key and a log line.
+ID_MAX_CHARS = 128
+PROJECT_ID_MAX_CHARS = ID_MAX_CHARS
+
+
+def checkDocumentId(value: str) -> str:
+    """Refuse an id Firestore would refuse. Raises ValueError.
+
+    Every one of these reaches Firestore as a document id, and Firestore turns
+    a bad one into an InvalidArgument several layers below the request. What
+    that becomes on the way out differs by which id it was, and both outcomes
+    are wrong: an unchecked projectId escapes as a 500, and an unchecked
+    conversationId is *worse* -- the store wraps it as "unreachable", the route
+    degrades to answering without history (invariant 24), and the caller gets a
+    cheerful 200 under an id that can never work. Which is precisely the failure
+    invariant 25 exists to prevent, arriving through the guard meant to prevent
+    it. It also spends a model call on every attempt.
+    """
+    if not value:
+        raise ValueError("must not be empty")
+    if len(value) > ID_MAX_CHARS:
+        raise ValueError(f"must be at most {ID_MAX_CHARS} characters")
+    if "/" in value:
+        raise ValueError("must not contain '/'")
+    if value in (".", ".."):
+        raise ValueError("must not be '.' or '..'")
+    if value.startswith("__") and value.endswith("__"):
+        raise ValueError("must not be wrapped in double underscores")
+    return value
+
+
+def checkProjectId(projectId: str) -> str:
+    """Refuse a projectId Firestore would refuse. Raises ValueError."""
+    return checkDocumentId(projectId)
+
+
+# The wire type. Everything that takes a projectId uses it, in a body or a path,
+# so the rule cannot drift between the two -- which is exactly how the path
+# routes ended up with no length cap when the project moved out of the body.
+ProjectId = Annotated[
+    str, Field(min_length=1, max_length=ID_MAX_CHARS), AfterValidator(checkProjectId)
+]
+
+# Same rule, and for the same reason: this is a document id too.
+ConversationId = Annotated[
+    str, Field(min_length=1, max_length=ID_MAX_CHARS), AfterValidator(checkDocumentId)
+]
 
 
 class CamelModel(BaseModel):
@@ -20,39 +78,9 @@ class CamelModel(BaseModel):
     model_config = ConfigDict(alias_generator=to_camel, populate_by_name=True)
 
 
-class QueryRequest(CamelModel):
-    model_config = ConfigDict(
-        alias_generator=to_camel,
-        populate_by_name=True,
-        extra="forbid",
-    )
-
-    server_id: str = Field(min_length=1, max_length=128)
-    question: str = Field(min_length=1, max_length=4000)
-    project_id: str = Field(min_length=1, max_length=128)
-    # The conversation this question belongs to. Absent means "start one", and
-    # the id of the new conversation comes back on the response. An id that does
-    # not exist is a 404 rather than a new conversation: a typo silently opening
-    # a fresh one is the failure a caller cannot see, because it looks exactly
-    # like a model that has forgotten everything.
-    #
-    # `chatId` was briefly accepted here as an input alias while the storage
-    # layer still said "chat". It is not any more: the word is gone from the
-    # whole service, and `extra="forbid"` means a caller still sending it gets a
-    # 422 naming the field rather than a 200 for a question that quietly started
-    # a new conversation -- which is the same failure this endpoint 404s for.
-    conversation_id: str | None = Field(default=None, min_length=1, max_length=128)
-
-
-class QueryResponse(CamelModel):
-    answer: str
-    project_id: str
-    # Always returned, including on the turn that created it -- it is the only
-    # way a caller learns the id of a conversation it did not name.
-    conversation_id: str | None = None
-
-
 class ConversationCreateRequest(CamelModel):
+    """Start a conversation. The project is in the path, not here."""
+
     model_config = ConfigDict(
         alias_generator=to_camel,
         populate_by_name=True,
@@ -60,16 +88,10 @@ class ConversationCreateRequest(CamelModel):
     )
 
     server_id: str = Field(min_length=1, max_length=128)
-    # The project this conversation belongs to. Conversations are keyed by
-    # projectId and never by the ragDbId behind it: a project's first
-    # conversation can start before anything has been ingested, and a ragDbId is
-    # deliberately allowed to change, which would orphan every conversation
-    # keyed on it.
-    project_id: str = Field(min_length=1, max_length=128)
     # Optional, and optional for a reason: left empty, the first question asked
-    # here becomes the title (see FirestoreConversationStore._appendTurn). A caller that
-    # has a name for the conversation up front -- a UI where the user typed one
-    # -- can say so instead.
+    # here becomes the title (see FirestoreConversationStore._appendTurn). A
+    # caller that has a name up front -- a UI where the user typed one -- can
+    # say so instead.
     title: str = Field(default="", max_length=200)
 
 
@@ -89,7 +111,13 @@ class ConversationCreateResponse(CamelModel):
 
 
 class ConversationMessageRequest(CamelModel):
-    """A question posted to a conversation that already exists."""
+    """A question posted to the ``web`` gateway.
+
+    Only the web gateway uses this shape. WhatsApp and LINE send their own
+    envelope, which is validated by its signature rather than by a model here --
+    a stronger check, and the only one available, since neither platform will
+    add fields for us.
+    """
 
     model_config = ConfigDict(
         alias_generator=to_camel,
@@ -98,20 +126,40 @@ class ConversationMessageRequest(CamelModel):
     )
 
     server_id: str = Field(min_length=1, max_length=128)
-    project_id: str = Field(min_length=1, max_length=128)
-    # Required here, unlike on /query. That is the entire difference between the
-    # two endpoints: this one addresses a conversation that exists, so an id
-    # that does not resolve is a 404 and never a new conversation.
-    conversation_id: str = Field(min_length=1, max_length=128)
     question: str = Field(min_length=1, max_length=4000)
+    # Absent means "start one", and the id of the new conversation comes back on
+    # the response. An id that does not exist is a 404 rather than a new
+    # conversation: a typo silently opening a fresh one is the failure a caller
+    # cannot see, because it looks exactly like a model that has forgotten
+    # everything.
+    #
+    # The webhook gateways never send this. Neither WhatsApp nor LINE has any
+    # conversation id to offer -- they identify a *person*, not a thread -- so
+    # one is minted on their behalf and remembered against them; see
+    # app.stores.channelStore.
+    conversation_id: ConversationId | None = None
 
 
 class ConversationMessageResponse(CamelModel):
     answer: str
     project_id: str
-    # Echoed back, so a caller can compare it with what it sent. They differ
-    # only in the degraded case where the conversation store could not be reached.
-    conversation_id: str
+    # Always returned, including on the turn that created it -- it is the only
+    # way a caller learns the id of a conversation it did not name.
+    conversation_id: str | None = None
+
+
+class WebhookAck(CamelModel):
+    """What a messaging platform gets back, and all it gets back.
+
+    Small and uninformative on purpose. Nothing on the far side reads it, and a
+    webhook response is not a place to describe this service's internals to
+    whoever found the URL. ``accepted`` is for our own logs and tests: how many
+    messages in the delivery were queued, after receipts, non-text and
+    redeliveries were dropped.
+    """
+
+    status: str = "accepted"
+    accepted: int = 0
 
 
 class DocumentIngestRequest(CamelModel):
@@ -127,7 +175,7 @@ class DocumentIngestRequest(CamelModel):
     document_link: str = Field(min_length=1, max_length=2048)
     # The project this document belongs to. A project's first submission is
     # what brings its RAG database into existence -- see app.stores.projectStore.
-    project_id: str = Field(min_length=1, max_length=128)
+    project_id: ProjectId
 
 
 class JobStatusRequest(CamelModel):
@@ -139,7 +187,7 @@ class JobStatusRequest(CamelModel):
 
     server_id: str = Field(min_length=1, max_length=128)
     # The project whose ingestion is being asked about.
-    project_id: str = Field(min_length=1, max_length=128)
+    project_id: ProjectId
 
 
 class JobResponse(CamelModel):
@@ -185,7 +233,7 @@ class SearchRequest(CamelModel):
     )
 
     server_id: str = Field(min_length=1, max_length=128)
-    project_id: str = Field(min_length=1, max_length=128)
+    project_id: ProjectId
     query: str = Field(min_length=1, max_length=4000)
     # Capped so one request cannot ask for a whole database back.
     top_k: int = Field(default=5, ge=1, le=50)

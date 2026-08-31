@@ -39,6 +39,7 @@ import logging
 import os
 
 from app.agent.llmManager import summariserModel
+from app.agent.usage import trackUsage
 from app.stores.conversationStore import ConversationWindow, ContextEntry
 
 logger = logging.getLogger(__name__)
@@ -211,7 +212,7 @@ def _foldedMaterial(window: ConversationWindow, throughTurn: int) -> str:
 
 
 async def summariseConversation(
-    window: ConversationWindow, model=None
+    window: ConversationWindow, model=None, usage=None
 ) -> tuple[str, int, int] | None:
     """Fold this window down. Returns (summary, throughTurn, throughContext).
 
@@ -225,12 +226,13 @@ async def summariseConversation(
         return None
 
     try:
-        response = await (model or summariserModel()).ainvoke(
-            [
-                {"role": "system", "content": SUMMARISER_SYSTEM_PROMPT},
-                {"role": "user", "content": material},
-            ]
-        )
+        with trackUsage(usage, "summariser"):
+            response = await (model or summariserModel()).ainvoke(
+                [
+                    {"role": "system", "content": SUMMARISER_SYSTEM_PROMPT},
+                    {"role": "user", "content": material},
+                ]
+            )
     except Exception:
         # Not fatal. The conversation is still answerable, it just costs this
         # turn more tokens than it should have -- and the caller falls back to

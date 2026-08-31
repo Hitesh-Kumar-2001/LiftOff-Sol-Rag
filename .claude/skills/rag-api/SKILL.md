@@ -49,9 +49,9 @@ in the API.
 
 | Route | Does |
 | --- | --- |
-| `POST /api/v1/query` | The one-call form: answers, and starts a conversation if none was named. Takes an optional `conversationId` and always returns one — see *Conversations*. 404 unknown id, 502 provider failure, 503 no model configured, 504 past `RAG_ANSWER_TIMEOUT_SECONDS`. |
-| `POST /api/v1/conversation` | Creates an empty conversation and returns its `conversationId` plus the `systemPrompt` snapshotted onto it. 201. Resolves the project read-only — starting one never mints a `ragDbId`. 503 if the conversation store is unreachable, because unlike the answering routes there is nothing to degrade to. |
-| `POST /api/v1/conversation/message` | Posts a question to an existing conversation. `conversationId` is **required** — that is the only difference from `/query`, and both run the same `_runTurn`. Loads the window Redis-first. Same 404/502/503/504. |
+| `POST /api/v1/conversations/{projectId}` | Creates an empty conversation, returns its `conversationId` and the `systemPrompt` snapshotted onto it. 201. Read-only on the project — starting one never mints a `ragDbId`. |
+| `POST /api/v1/conversations/{projectId}/{gateway}` | **One route, every gateway.** `web` takes `{serverId, question, conversationId?}` and answers on the response. `whatsapp` / `line` take the platform's signed body, verify it, 200 immediately, and push the answer back afterwards. 403 bad signature, 404 unknown gateway or unknown `conversationId`, 502/503/504 as `web` only. |
+| `GET /api/v1/conversations/{projectId}/{gateway}` | The gateway's URL-verification handshake. Meta's `hub.challenge`, echoed as plain text. 405 for gateways with no handshake (LINE, web). |
 | `POST /api/v1/document` | Resolves-or-creates the project's database, claims it, queues ingestion, returns 202. 409 on conflict, 503 on dispatch failure. |
 | `POST /api/v1/document/status` | Job status. Returns `projectId` normally, or `documentLink` when the strategy was RAW. 404 if the project or its job is unknown. |
 | `POST /api/v1/search` | Retrieval only — the matching chunks, not a generated answer. An unresolved project gives empty hits, not a 404. |
@@ -62,8 +62,10 @@ in the API.
 **API layer** — [app/main.py](app/main.py) builds the app (the lifespan runs
 `checkConfiguration()` so a bad config fails the deploy, and awaits in-flight jobs on
 shutdown) and owns the 422 handler that allowlists `type`/`loc`/`msg`
-so a malformed request is not echoed back. [app/api/routes.py](app/api/routes.py) has the six
-routes and is where `projectId` becomes `ragDbId`. [app/api/schemas.py](app/api/schemas.py) is
+so a malformed request is not echoed back. [app/api/routes.py](app/api/routes.py) has the three
+document and search routes and is where `projectId` becomes `ragDbId`;
+[app/api/conversationRoutes.py](app/api/conversationRoutes.py) is the whole conversation
+surface, one route for every gateway. [app/api/schemas.py](app/api/schemas.py) is
 the wire contract. [app/stores/projectStore.py](app/stores/projectStore.py) holds the mapping —
 `ProjectStore` protocol, the Firestore implementation, `buildProjectStore()`
 factory. [app/infra/machineStats.py](app/infra/machineStats.py) reads CPU/memory/disk via `psutil`
@@ -99,7 +101,24 @@ Redis in front, `ConversationStore` protocol + Firestore + factory. Full schema 
 rationale in [docs/conversationSchema.md](docs/conversationSchema.md) — read that before changing
 anything about how a conversation is stored.
 
-**Auth** — none. There is no auth module; see the note at the top.
+**Channels** — the messaging gateways, in [app/channels/](app/channels/).
+[channel.py](app/channels/channel.py) is the `Channel` protocol every gateway
+satisfies (`verify` / `parse` / `send`) plus `IncomingMessage` and the shared HMAC
+helpers; [whatsapp.py](app/channels/whatsapp.py) and [line.py](app/channels/line.py) are
+the two adapters; [registry.py](app/channels/registry.py) is the one place a gateway is
+registered; [sender.py](app/channels/sender.py) is the single outbound path, and the only
+thing that turns "an answer was produced" into "an answer was delivered".
+The routes live with the web ones in
+[app/api/conversationRoutes.py](app/api/conversationRoutes.py); per-project credentials are
+in [app/stores/channelStore.py](app/stores/channelStore.py). See *Messaging channels*.
+
+**Usage** — [app/agent/usage.py](app/agent/usage.py) collects what an answer cost while
+it is being produced (`UsageLog`, threaded like `searchLog`; `trackUsage` wraps each role
+in its own `get_usage_metadata_callback`), and
+[app/stores/usageStore.py](app/stores/usageStore.py) writes it. See *Token accounting*.
+
+**Auth** — none, except on the webhooks. There is no auth module; see the note at the
+top and the signature checks in *Messaging channels*.
 
 **Jobs** — [app/jobs/job.py](app/jobs/job.py) is the `Job` record, `JobStatus`, `runJob`, the
 `JobStore` protocol, and `resolveSubmission` (the shared NEW/REUSE/CONFLICT rules).
@@ -225,6 +244,132 @@ than a customer.
 Unlike `config/models.toml` there *is* a built-in fallback here: a default model name goes
 stale the moment a vendor retires it, whereas a default prompt is prose with no vendor
 behind it and works forever.
+
+## Messaging channels
+
+The same agent, reached from WhatsApp or LINE instead of over HTTP. One thing is
+different and it shapes everything else: **the answer does not go back on the response.**
+
+```
+POST /api/v1/conversations/{projectId}            start one
+POST /api/v1/conversations/{projectId}/{gateway}  say something
+GET  /api/v1/conversations/{projectId}/{gateway}  the gateway's handshake
+```
+
+`gateway` is `web`, `whatsapp`, `line`, or whatever is registered next. **One route**,
+dispatching on the last segment. What differs per gateway is only this:
+
+```
+web       question in the body  -> answer in the response
+whatsapp  signed platform body  -> 200 now, answer pushed back later
+line      signed platform body  -> 200 now, answer pushed back later
+```
+
+Everything then runs the same `runTurn`. `web` is deliberately **not** a `Channel` — it
+has no signature to verify, no envelope to parse and no outbound API, so implementing
+that protocol for it would mean three methods that lie.
+
+Every one of these platforms treats a slow or non-2xx webhook as a failure and
+redelivers; Meta disables one that keeps failing. Answering takes up to
+`RAG_ANSWER_TIMEOUT_SECONDS`, far past that. So the delivery is verified, acknowledged,
+and answered in a `BackgroundTasks` job that pushes the reply back through the platform's
+own API.
+
+**Adding a gateway is two steps**: an adapter module implementing `Channel`, and a line in
+`registry.CHANNELS`. There is no third — the route is parameterised, so a gateway becomes
+reachable the moment it is registered. Nothing else knows the list; the store keys its
+config map on the same names and the sender dispatches on them. `getChannel` raising for
+an unknown name is what the route turns into a 404 naming the gateways that do exist.
+
+**The project is in the path, not the body.** The one place this API breaks its
+everything-in-the-body convention, and it has to: the body is written by the platform and
+nothing can be added to it. The URL is the only part of the request this service controls,
+because it is what gets pasted into the platform's console — so one deployment serves any
+number of projects, each with its own webhook URL and credentials.
+
+**The prefix is a literal segment**, not `/api/v1/{projectId}/{gateway}`. A bare
+two-segment pattern under `/api/v1` also matches `/api/v1/document/status` —
+`projectId="document", gateway="status"` — and which wins is registration order. The
+document and search routes keep the older everything-in-the-body convention: nothing
+forces them to move, and changing a working contract to match a constraint that does not
+apply to it would be churn.
+
+**Neither platform gives you a conversation id.** WhatsApp identifies a *person*
+(`from` / `wa_id`, plus your `phone_number_id`); its `conversation.id` appears only on
+outbound status callbacks and is a 24-hour **billing** window that rotates. LINE gives
+`source.userId`, stable but scoped to the Official Account. Neither has any notion of a
+thread, and neither ever signals that a conversation started or ended — which is exactly
+why the `threads` subcollection exists: we mint the `conversationId` and remember it
+against the person. A consequence worth knowing: a conversation never ends on its own, so
+"start fresh after N hours of silence" is a rule we would have to add.
+
+LINE does hand us `deliveryContext.isRedelivery`. It is carried on `IncomingMessage` for
+the log but does **not** gate the answer: a redelivery means the platform did not get a
+2xx last time, which usually means the answer was never queued.
+
+**This is the only real authentication in the service.** Every other endpoint trusts an
+unverified `serverId`. A webhook is a public URL anyone can find and POST to, and what
+arrives is answered by a paid model call, so every delivery is HMAC-checked against the
+project's own secret over the *raw bytes* — parsing and re-serialising changes key order
+and the signature then fails in a way that reads as a wrong secret. `verify` returns False
+when the secret is missing: **fails closed**, because a gateway that accepts everything
+until somebody adds a secret looks exactly like one that works.
+
+**A redelivery must not be answered twice.** `_alreadyHandled` claims the platform's
+message id in Redis with `SET NX`. That one fails *open* — answering twice is worse than
+not answering — which is the opposite of the signature check, deliberately.
+
+Storage is `ragChannels/{projectId}`: a `channels` map (one document, because a project
+has a handful of gateways and each config is a few short strings) and a `threads`
+subcollection mapping `{channel}:{userId}` to a `conversationId`, so a person's history
+follows them between messages. A thread is linked only after a *successful* send — a
+conversation they never received an answer from is one they will ask again from.
+
+## Token accounting
+
+Three separately billed models run on the way to one answer, and only one of them is
+visible from outside:
+
+```
+summariser   folds the conversation, when it has outgrown its budget
+agent        answers -- several internal turns, and twice if the review fails
+reviewer     grades the draft, on every question
+```
+
+`runTurn` opens a `UsageLog`, threads it through all three, and writes it after the turn
+is recorded. Storage mirrors the conversation tree:
+
+```
+ragUsage/{projectId}                    the project's running total
+  conversations/{conversationId}        the conversation's total, by role
+    messages/{messageId}                one answered question
+```
+
+`messageId` is the assistant's own zero-padded turn index, so a usage row joins straight
+onto the `messages/{turnIndex}` document in `ragConversations`.
+
+- **A callback per role, not per request.** The handler aggregates by *model name*, and
+  all three roles are usually pointed at the same model — one shared context would merge
+  them and lose the breakdown that is the entire point.
+- **The callback, not the return value.** `with_structured_output` hands back the parsed
+  object and the `AIMessage` carrying `usage_metadata` is gone, so the reviewer and the
+  summariser would both report zero if usage were read off what they return.
+- **Rollups are `Increment`, leaves are `set`.** Two answers in one conversation at the
+  same moment would otherwise both read the old total and one would vanish. The trade is
+  that an increment applied twice counts twice, where the message document — written once
+  under a deterministic id — is idempotent.
+- **Recorded in a `finally`.** A call that raised after the provider produced tokens was
+  still billed for them, and an expensive failure is the one worth being able to see.
+- **Isolated by contextvar.** Each request runs in its own asyncio task, so concurrent
+  answers do not bill each other. `tests/testUsage.py` pins that, because the failure
+  would be silent and unexplainable after the fact.
+- **Nothing here may fail a request.** The model call is already paid for; a write that
+  does not land costs a number in a report.
+- `cachedInputTokens` and `reasoningTokens` are kept alongside the totals that contain
+  them, because they are priced differently and a total alone cannot be turned into money.
+- The **chunker** is absent: it runs during ingestion, against a document rather than a
+  conversation, so its cost belongs to a job and not to anybody's message. Nothing records
+  it yet.
 
 ## Where things run
 
@@ -438,6 +583,8 @@ so no misconfiguration can quietly downgrade a real deployment.
 | `RAG_PROMPT_CONFIG` | Where `config/prompts.toml` lives. |
 | `RAG_DEFAULT_SYSTEM_PROMPT`, `RAG_PROMPT_TTL_SECONDS`, `RAG_PROMPT_CACHE_PREFIX` | A whole prompt, overriding the persona entirely (and suppressing its review criteria); 3600s; `ragPrompt:`. |
 | `FIRESTORE_PROMPTS_COLLECTION` / `FIRESTORE_PROJECT_PROMPTS_COLLECTION` | `systemPrompts` / `projectPrompts`. |
+| `FIRESTORE_USAGE_COLLECTION` | `ragUsage`. Per-project, per-conversation and per-message token cost. |
+| `FIRESTORE_CHANNELS_COLLECTION` | `ragChannels`. Per-project gateway credentials and the platform-user → conversation map. |
 | `FIRESTORE_CONVERSATIONS_COLLECTION` | `ragConversations`. The conversation root; see [docs/conversationSchema.md](docs/conversationSchema.md). |
 | `RAG_CONVERSATION_CACHE_PREFIX` / `RAG_CONVERSATION_CACHE_TTL_SECONDS` | `ragConversation:`, 3600. The assembled window in Redis. |
 | `RAG_CONVERSATION_TTL_SECONDS` | 90 days, written as `expiresAt`. Deletes nothing without a TTL policy on `conversations`, `messages` and `context`. |
@@ -458,6 +605,33 @@ this service's own credentials for the infrastructure it calls, not its callers'
   continue it, and cannot show the user the ones they already had. Deleting a conversation means
   deleting both subcollections first — Firestore does not remove them with the parent;
   see `deleteConversation` in `scripts/liveConversationCheck.py`.
+- **Request bodies are uncapped on `/document`, `/document/status` and `/search`.** The
+  conversation routes read their own bodies and cap them at `MAX_WEBHOOK_BODY_BYTES`;
+  those three are parsed by FastAPI before this code sees them, and uvicorn has no
+  default limit. A service-wide cap belongs in a proxy or an ASGI middleware.
+- **Archive expansion has no size budget.** `MAX_ARCHIVE_DEPTH = 1` bounds *nesting* and
+  `MAX_DOWNLOAD_BYTES` (200MB) bounds the *download*, but `_analyzeArchiveEntries` calls
+  `archive.read(info)` per member with nothing tracking the total decompressed bytes — so
+  a single-level archive inside the download limit can still expand without bound and OOM
+  the worker. The comment on `MAX_ARCHIVE_DEPTH` already says to raise it "only alongside
+  a size budget"; the budget is the part that does not exist.
+- **Nothing reads the usage back.** `projectTotal` and `conversationTotal` exist on the
+  store and are tested; no endpoint serves them, and there is no per-message listing, no
+  date bucketing and no cost-in-currency conversion — only tokens.
+- **Ingestion's token cost is not recorded.** The chunker is by far the highest call
+  volume in the service and none of it reaches `ragUsage`, so a project's total is its
+  *answering* cost only.
+- **A webhook answer is not durable.** It runs in a FastAPI `BackgroundTasks` job in
+  the API process, so a restart between the 200 and the send loses that person's answer
+  with nothing recording it — and the platform will not redeliver, because it was already
+  acknowledged. The ingestion queue is not reusable for this (its `jobId` *is* a
+  `ragDbId`, one job per database); a second Redis queue is the fix when it matters.
+- **Channel credentials sit in Firestore in plaintext.** No field-level encryption, and an
+  access token there is enough to send messages as somebody else's business. Acceptable
+  only because nothing real is stored yet — before it is, put them in Secret Manager and
+  keep a resource name here.
+- **Only text is handled.** Images, stickers, locations and button replies are dropped in
+  `parse` rather than answered, and outbound is text only.
 - **`expiresAt` is written on every conversation document but deletes nothing** until a TTL
   policy is created in the Firestore console on each of `conversations`, `messages`, `context`.
 - **Web search results are not stored on a conversation.** Only `searchProject` retrievals are.
@@ -473,9 +647,6 @@ this service's own credentials for the infrastructure it calls, not its callers'
   through `runText` with text already extracted (which is what `ragProcessor` does).
 - **`MAX_ARCHIVE_DEPTH = 1`** in `app/ingestion/documents.py` — one level of archive
   nesting, deliberately. Raising it multiplies the worst-case work per level.
-- **`Dockerfile`, `.dockerignore`, and `docker-compose.yml` are untracked.** Compose
-  defines `api`, `worker`, and `redis`; `worker` exits immediately when `REDIS_URL` is
-  unset, which is correct — the API is ingesting instead.
 - **`/health`'s machine figures describe the host, not the container.** `psutil` reads
   `/proc`, so under Docker they show host CPU and memory rather than the cgroup limit —
   a 512MB container on a 32GB host reports 32GB and looks idle until it is OOM-killed.

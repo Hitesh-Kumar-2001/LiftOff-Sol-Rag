@@ -70,7 +70,10 @@ def install(monkeypatch, fake: FakeAgent, verdicts: list[Review | None]):
     monkeypatch.setattr(agentModule, "buildAgent", lambda *a, **k: fake)
     reviews: list[tuple[str, str]] = []
 
-    async def fakeReview(question, answer, model=None):
+    async def fakeReview(question, answer, model=None, usage=None):
+        # `usage` is the token accumulator the real reviewer fills in. Accepted
+        # and ignored: these tests are about the loop, and a stubbed model
+        # reports no tokens anyway.
         reviews.append((question, answer))
         return verdicts.pop(0) if verdicts else None
 

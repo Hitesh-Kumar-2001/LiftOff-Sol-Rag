@@ -1,7 +1,7 @@
 """The two conversation endpoints: create one, then post questions to it.
 
-    POST /api/v1/conversation          -> conversationId
-    POST /api/v1/conversation/message  -> answer
+    POST /api/v1/conversations/{projectId}     -> conversationId
+    POST /api/v1/conversations/{projectId}/web -> answer
 
 ``/query`` is the one-call form of the same thing and is covered in
 tests/testQuery.py; all three run the same ``_runTurn``, so what is tested here
@@ -26,7 +26,7 @@ from fastapi.testclient import TestClient
 
 from app.agent.agent import AgentAnswer
 from app.agent.reviewer import ReviewOutcome
-from app.api import routes
+from app.api import conversationRoutes
 from app.main import app
 from app.promptConfig import defaultSystemPrompt
 from app.stores.conversationStore import FirestoreConversationStore, getConversationStore
@@ -79,33 +79,43 @@ def stubbedAgent(monkeypatch) -> list[dict]:
             reviewOutcome=ReviewOutcome(score=0.9, suggestion="", retried=False),
         )
 
-    monkeypatch.setattr(routes, "answerQuestion", fakeAnswer)
+    monkeypatch.setattr(conversationRoutes, "answerQuestion", fakeAnswer)
     return recorded
 
 
+def createUrl(projectId: str | None = None) -> str:
+    return f"/api/v1/conversations/{projectId or PROJECT_ID}"
+
+
+def webUrl(projectId: str | None = None) -> str:
+    """Where a browser posts a question. The project is in the path now, so a
+    test that wants a different project builds a different URL rather than
+    overriding a body field."""
+    return f"/api/v1/conversations/{projectId or PROJECT_ID}/web"
+
+
 def body(**overrides) -> dict:
-    return {"serverId": "billing-service", "projectId": PROJECT_ID} | overrides
+    return {"serverId": "billing-service"} | overrides
 
 
 def startConversation(client: TestClient, **overrides) -> str:
-    return client.post("/api/v1/conversation", json=body(**overrides)).json()[
+    return client.post(createUrl(), json=body(**overrides)).json()[
         "conversationId"
     ]
 
 
 def ask(client: TestClient, conversationId: str, question: str):
     return client.post(
-        "/api/v1/conversation/message",
-        json=body(conversationId=conversationId, question=question),
+        webUrl(), json=body(conversationId=conversationId, question=question)
     )
 
 
-# --- POST /api/v1/conversation --------------------------------------------
+# --- POST /api/v1/conversations/{projectId} -------------------------------
 
 
 def testCreatingAConversationReturnsAnIdThatResolves(client: TestClient, conversationStore) -> None:
     """The whole point of the endpoint: an id, before any question exists."""
-    response = client.post("/api/v1/conversation", json=body())
+    response = client.post(createUrl(), json=body())
 
     assert response.status_code == 201
     payload = response.json()
@@ -128,7 +138,7 @@ def testTheProjectsPromptIsSnapshottedOntoIt(client: TestClient, conversationSto
     """It answers under the instructions it was opened with, even if the
     project's prompt is edited later -- so the prompt is decided here, and
     returned so the caller can see which one it got."""
-    payload = client.post("/api/v1/conversation", json=body()).json()
+    payload = client.post(createUrl(), json=body()).json()
 
     assert payload["systemPrompt"] == defaultSystemPrompt()
     window = asyncio.run(conversationStore.loadWindow(PROJECT_ID, payload["conversationId"]))
@@ -181,16 +191,16 @@ def testAnUnreachableStoreIsA503OnCreate(
 
     monkeypatch.setattr(conversationStore, "createConversation", unreachable)
 
-    assert client.post("/api/v1/conversation", json=body()).status_code == 503
+    assert client.post(createUrl(), json=body()).status_code == 503
 
 
 def testAnUnknownFieldIsRejected(client: TestClient) -> None:
     """extra="forbid", like every other request model here: a caller sending
     `conversationID` and getting a 201 for a field that was ignored is worse than a 422."""
-    assert client.post("/api/v1/conversation", json=body(ragDbId="nope")).status_code == 422
+    assert client.post(createUrl(), json=body(ragDbId="nope")).status_code == 422
 
 
-# --- POST /api/v1/conversation/message ------------------------------------
+# --- POST /api/v1/conversations/{projectId}/web ---------------------------
 
 
 def testAQuestionIsAnsweredInTheConversation(
@@ -229,9 +239,7 @@ def testAConversationIdIsRequired(client: TestClient) -> None:
     """The one difference from /query. A caller with nothing to continue should
     be sent to /conversation or /query, not quietly given a new conversation
     under an endpoint whose name says it is addressing an existing one."""
-    response = client.post(
-        "/api/v1/conversation/message", json=body(question="What is the refund window?")
-    )
+    response = client.post(webUrl(), json=body())
 
     assert response.status_code == 422
 
@@ -248,12 +256,8 @@ def testAConversationIsScopedToItsProject(
     conversationId = startConversation(client)
 
     response = client.post(
-        "/api/v1/conversation/message",
-        json=body(
-            projectId=scratch.projectId("other"),
-            conversationId=conversationId,
-            question="Anything?",
-        ),
+        webUrl(scratch.projectId("other")),
+        json=body(conversationId=conversationId, question="Anything?"),
     )
 
     assert response.status_code == 404

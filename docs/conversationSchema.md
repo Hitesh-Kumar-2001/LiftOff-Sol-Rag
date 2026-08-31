@@ -343,89 +343,88 @@ conversation from Firestore, which is slower rather than wrong.
 
 ## Wire contract
 
-### `POST /api/v1/conversation` — start one
+### `POST /api/v1/conversations/{projectId}` — start one
 
 ```jsonc
-// request
-{
-  "serverId": "billing-service",
-  "projectId": "handbook",
-  "title": "Refund policy"   // optional; the first question fills it in if omitted
-}
-
-// response, 201
-{
-  "conversationId": "3f2a…",
-  "projectId": "handbook",
-  "systemPrompt": "You are a helpful assistant…"   // the snapshot it will answer under
-}
+// request                          // response, 201
+{ "serverId": "billing-service",    { "conversationId": "3f2a…",
+  "title": "Refund policy" }          "projectId": "handbook",
+                                      "systemPrompt": "You are…" }
 ```
 
-For the caller that needs the id before there is a question — a UI opening a new
-conversation has a window to render and a record to attach to the user at the
-moment the user clicks, and none of that can wait on a model call. `/query`
-still starts a conversation for a question that names none, so this is an addition to
-that path and not a replacement for it.
+`title` is optional — the first question fills it in. For the caller that needs
+the id before there is a question: a UI opening a new conversation has a window
+to render and a record to attach to the user the moment the user clicks, and
+none of that can wait on a model call.
 
-Two things are decided by this call and cannot be decided later: the
-`systemPrompt` snapshot (see *Why `systemPrompt` is a snapshot*) and the
-`ragDbId` recorded for audit. The project is resolved **read-only** — starting a
-conversation never brings a RAG database into existence, or every mistyped
-`projectId` would leave an empty one behind forever.
+Two things are decided here and cannot be decided later: the `systemPrompt`
+snapshot (see *Why `systemPrompt` is a snapshot*) and the `ragDbId` recorded for
+audit. The project is resolved **read-only** — starting a conversation never
+brings a RAG database into existence.
 
-A conversation store failure here is a **503**, not a degraded success. That is the
-opposite of `/query`, and deliberately so: `/query` degrades because it is
+A store failure here is a **503**, not a degraded success. That is the opposite
+of the answering routes, and deliberately so: those degrade because they are
 holding an answer that was already paid for, whereas this request *is* the
 creation. A 201 carrying an id nothing stored would be a conversation the caller
 can address and every later request will 404.
 
-### `POST /api/v1/conversation/message` — post a question to it
+### `POST /api/v1/conversations/{projectId}/{gateway}` — say something
+
+One route, three arrival shapes. `gateway` is `web`, `whatsapp` or `line`.
 
 ```jsonc
-// request
+// web request
 {
   "serverId": "billing-service",
-  "projectId": "handbook",
-  "conversationId": "3f2a…",     // required here, unlike on /query
-  "question": "And for gift cards?"
-}
-
-// response
-{
-  "answer": "Gift cards are non-refundable.",
-  "projectId": "handbook",
-  "conversationId": "3f2a…"
-}
-```
-
-`conversationId` is the only difference from `/query` — both run the same
-`_runTurn` in `app/api/routes.py`. Requiring it is what lets this endpoint 404
-an id it does not recognise instead of quietly opening a new conversation under
-a name that says it is addressing an existing one.
-
-### `POST /api/v1/query` — the one-call form
-
-```jsonc
-// request
-{
-  "serverId": "billing-service",
-  "projectId": "handbook",
   "question": "And for gift cards?",
-  "conversationId": "3f2a…"   // omit to start a new one
+  "conversationId": "3f2a…"        // omit to start one
 }
 
-// response
+// web response
 {
   "answer": "Gift cards are non-refundable.",
   "projectId": "handbook",
-  "conversationId": "3f2a…"   // always returned, including on the turn that created it
+  "conversationId": "3f2a…"        // always returned
 }
 ```
 
-Which of the two forms to use is about who keeps the id. A UI that renders a
-conversation list wants one before there is a question, and uses
-`/conversation` then `/conversation/message`. A caller that just wants an answer,
-or is happy to learn the id from the first response, uses `/query`.
+`whatsapp` and `line` send the platform's own signed envelope instead, and get
+back only `{"status": "accepted", "accepted": 1}` — the answer arrives later,
+through the platform's API. Nothing on the far side reads that body, and a
+webhook response is not a place to describe this service to whoever found the
+URL.
+
+**The project is in the path for every gateway.** It has to be for a webhook —
+the body is written by WhatsApp or LINE and nothing can be added to it — and the
+web gateway follows so there is one shape rather than two.
+
+### Where a conversation id comes from on a messaging platform
+
+**Neither WhatsApp nor LINE provides one.** This is worth stating plainly,
+because it is the reason the `threads` subcollection exists.
+
+| Platform | What arrives | What it identifies |
+| --- | --- | --- |
+| WhatsApp | `messages[].id` (`wamid.…`) | one **message** |
+| WhatsApp | `messages[].from` / `contacts[].wa_id` | the **person** (their phone number) |
+| WhatsApp | `metadata.phone_number_id` | **your** number |
+| WhatsApp | `statuses[].conversation.id` | a 24-hour **billing** window, outbound only — it rotates, and never appears on an inbound message |
+| LINE | `message.id` | one **message** |
+| LINE | `source.userId` | the **person**, scoped to this Official Account |
+| LINE | `replyToken` | one **event**, single-use, ~1 minute |
+
+So the only durable identity either platform offers is *who is speaking*. We mint
+the `conversationId` ourselves and file it under `{channel}:{userId}`.
+
+Two consequences:
+
+- **A conversation never ends on its own.** Somebody who writes again after six
+  months continues the same one unless its TTL expired it. "Start fresh after N
+  hours of silence" is a rule we would have to add; the platform will never tell
+  us.
+- **LINE's `userId` is per Official Account**, so the same person messaging two
+  projects is two different users. That matches how conversations are keyed here,
+  which is convenient rather than designed.
 
 `ragDbId` still appears nowhere on the wire.
 
