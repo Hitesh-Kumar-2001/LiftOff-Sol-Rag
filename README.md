@@ -9,10 +9,12 @@ searches them. Managed with `uv`.
 > and read any project's chunks, under any name they choose. Do not expose it
 > publicly without putting authentication in front of it first.
 
-**Status:** ingestion, chunking, embedding, retrieval, and answering are built
-and tested. What is not is listed under
-[What isn't built yet](#what-isnt-built-yet) — conversation history is the main gap:
-every question is a single turn today.
+**Status:** ingestion, chunking, embedding, retrieval, answering, multi-turn
+conversations, the WhatsApp and LINE gateways, and per-answer token accounting are
+built and tested. What is not is listed under
+[What isn't built yet](#what-isnt-built-yet) — the largest gaps are that nothing
+reads a conversation or its cost back over HTTP, and that there is still no
+authentication anywhere except the webhook signatures.
 
 ## Run locally
 
@@ -159,7 +161,7 @@ question ─► system prompt (Firestore, cached in Redis)
 ```
 
 The agent is a [deepagents](https://github.com/langchain-ai/deepagents) deep
-agent, in [app/agent/](app/agent/). Four things about it are deliberate:
+agent, in [app/agent/](app/agent/). Five things about it are deliberate:
 
 - **Retrieval is the agent's decision, not the route's.** It gets a search tool
   and calls it when the question needs it. A follow-up like "shorter, please"
@@ -181,6 +183,15 @@ agent, in [app/agent/](app/agent/). Four things about it are deliberate:
   documents genuinely cannot answer, an honest "the documents do not cover this"
   scores badly every time, because the reviewer grades the answer and not the
   corpus.
+- **OpenAI is called through the Responses API** (`/v1/responses`), not Chat
+  Completions. Not a preference: OpenAI's reasoning models refuse *function
+  tools* on `/v1/chat/completions` with a 400, and the agent is the only role
+  that binds one — every other role uses structured output, which is a response
+  format and works either way. So the failure had ingestion succeeding, startup
+  checks passing and `/health` green while every question came back 502.
+  `reasoning_effort='none'` is the other fix the vendor offers and it turns
+  reasoning off, which is the wrong trade for an agent whose job is to ground
+  every claim and refuse to invent a price.
 
 ### System prompts
 
@@ -456,7 +467,7 @@ Two things are known and accepted rather than fixed:
 | `REDIS_URL` | The job table and the worker queue, e.g. `redis://localhost:6379/0`. Requires `GCP_PROJECT_ID`. Unset runs everything in the API process. |
 | `RAG_JOB_TTL_SECONDS` | How long a job record survives its last write. Default 7 days, refreshed on every save. |
 | `RAG_REDIS_QUEUE` / `RAG_REDIS_JOB_PREFIX` | Redis key names. Default `ragQueue` and `ragJob:`. |
-| `RAG_QUEUE_POP_TIMEOUT` | How long the worker blocks before checking for a stop signal. Default 5s. |
+| `RAG_QUEUE_POP_TIMEOUT` | How long the worker blocks before checking for a stop signal. Default 2s, and it must stay below `RAG_REDIS_TIMEOUT` — the server holds a `BLMOVE` reply for this long while the client counts down its own socket read timeout, and at equal values an idle worker dies of a socket timeout on its first poll. |
 | `RAG_REDIS_TIMEOUT` | Socket timeout, so an unreachable Redis fails fast instead of hanging a request. Default 5s. |
 | `RAG_STALE_JOB_SECONDS` | Age past which a stuck job's `ragDbId` may be reclaimed. **Off by default** — nothing can hard-kill CPU-bound work now, so this must exceed the longest a job could legitimately run. |
 | `RAG_HEALTH_DISK_PATH` | Which filesystem `/health` reports on. Defaults to the working directory. |
@@ -536,5 +547,28 @@ an image — so it is mounted read-only at run time instead. Point
 ## Test
 
 ```powershell
-uv run pytest
+uv run pytest                  # the unit suite: tests/ only
+uv run pytest -m "not slow"    # skip the ~2 minute corpus tests
 ```
+
+The suite runs against **real Firestore** — there are no in-process stores — so
+it needs `GCP_PROJECT_ID` and credentials in `.env`. Every id is prefixed per
+run and deleted on teardown, so concurrent runs cannot see each other's data.
+Redis is `fakeredis`, in-process, so no server is needed for it.
+
+### The live end-to-end suite
+
+```powershell
+uv run pytest e2e -s
+```
+
+Separate, and deliberately not collected by `uv run pytest` (`testpaths` in
+`pyproject.toml` is `tests`). It ingests a real 16,500-token travel brochure
+through the real worker into a real vector database, then holds a **twenty-turn
+sales conversation** with the agent over HTTP — the web gateway only — and reads
+the token ledger back out of Firestore to check the arithmetic.
+
+It needs the API, the worker and Redis running, which it does not start for you;
+without them it skips with an instruction rather than failing. Every run costs
+real money at a real provider. Full instructions, the corpus, what each of the
+twenty turns is testing and how to spend less are in [e2e/README.md](e2e/README.md).

@@ -32,6 +32,7 @@ import logging
 import os
 
 from redis import Redis
+from redis.exceptions import TimeoutError as RedisTimeoutError
 
 logger = logging.getLogger(__name__)
 
@@ -41,7 +42,18 @@ PROCESSING_KEY = f"{QUEUE_KEY}:processing"
 # How long a worker blocks waiting for work before looping. Not a timeout on
 # anything -- it just gives the loop a chance to notice a shutdown signal
 # rather than sitting in a blocking call forever.
-POP_TIMEOUT_SECONDS = int(os.environ.get("RAG_QUEUE_POP_TIMEOUT", 5))
+#
+# **It has to stay below RAG_REDIS_TIMEOUT**, which is the socket read timeout
+# on the shared client (app.infra.redisClient, 5s). BLMOVE on an empty queue
+# means the server holds the reply for the whole of this timeout, and the client
+# is meanwhile counting down its own -- so at equal values the socket usually
+# fires first and an idle worker dies of a "Timeout reading from socket" within
+# seconds of starting. This defaulted to 5 against a socket timeout of 5, which
+# is exactly that, and it meant ingestion only ever worked when a job happened
+# to already be queued at startup. ``takeNext`` also catches the timeout now, so
+# raising this past the socket timeout costs a reconnect per idle cycle rather
+# than the worker.
+POP_TIMEOUT_SECONDS = int(os.environ.get("RAG_QUEUE_POP_TIMEOUT", 2))
 
 
 def enqueue(redis: Redis, ragDbId: str) -> None:
@@ -54,8 +66,27 @@ def takeNext(redis: Redis, timeout: int = POP_TIMEOUT_SECONDS) -> str | None:
 
     Returns None when the wait elapses with nothing queued, which is the
     worker's cue to check whether it has been asked to stop.
+
+    A socket read timeout *is* that answer, and is caught rather than raised.
+    Two independent clocks run during a BLMOVE -- the server holding the reply
+    for ``timeout``, and the client's own ``socket_timeout`` -- and whichever
+    expires first decides which of "nothing queued" and "Redis is unreachable"
+    the caller is told. They are the same event when the queue is quiet, and the
+    difference only matters if this raised, which it must not: the worker's
+    ``except`` sits *after* the pop, so an exception out of here does not get
+    logged and retried, it ends the process. An idle worker dying is worse than
+    a wasted reconnect, and it is invisible -- ``/document/status`` goes on
+    answering ``queued`` for a job nothing will ever pick up.
+
+    A genuinely unreachable Redis still surfaces: ``enqueue`` fails in the API
+    as a 503, the job store's own calls raise where they are handled, and
+    redis-py's health check reconnects underneath this.
     """
-    value = redis.blmove(QUEUE_KEY, PROCESSING_KEY, timeout, "RIGHT", "LEFT")
+    try:
+        value = redis.blmove(QUEUE_KEY, PROCESSING_KEY, timeout, "RIGHT", "LEFT")
+    except RedisTimeoutError:
+        logger.debug("No work within %ss (socket timeout on the blocking pop).", timeout)
+        return None
     return value.decode() if isinstance(value, bytes) else value
 
 

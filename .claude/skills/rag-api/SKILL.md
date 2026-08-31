@@ -18,8 +18,9 @@ recoverable from git history if it needs to come back.
 
 ```bash
 uv run uvicorn app.main:app --reload      # local API, docs at /docs
-uv run pytest                             # full suite
+uv run pytest                             # the unit suite -- tests/ only
 uv run pytest -m "not slow"               # skip the ~2min corpus tests
+uv run pytest e2e -s                      # the LIVE suite. Costs money. See below.
 python -m app.jobs.worker                 # the ingestion worker (needs REDIS_URL)
 docker compose up --build                 # api + worker + redis
 ```
@@ -40,6 +41,23 @@ rather than moves, and is idempotent. They read `.env`. **The suite reads it too
 stores, so `tests/conftest.py` requires `GCP_PROJECT_ID` and runs against real Firestore,
 prefixing every id per run and deleting what it created. Redis is `fakeredis`, in-process,
 so the real `QueuedJobManager` and `RedisJobStore` are exercised without a server.
+
+**`e2e/` is a second suite and is not part of `uv run pytest`** — `testpaths = ["tests"]`
+in `pyproject.toml` keeps it out, because every run costs real money at a real provider
+and needs the API, the worker and Redis actually running (it *skips* with an instruction
+if they are not; it never starts them). It ingests
+`e2e/documents/wanderlynTravel.txt` — a ~16.5k-token fictional travel brochure, sized
+deliberately into the **AI chunking** band — through the real worker into a real vector
+database, then runs a twenty-turn sales conversation through the `web` gateway and reads
+`ragUsage` back to check the arithmetic. One session-scoped fixture runs the conversation
+and twenty-five separate tests read the transcript, so a failure names one property rather
+than cascading. It asserts grounding (the October price, the single supplement, the module
+price), memory (turn 14 asks about a room without naming the trip — only the remembered
+trip gives $520), and honesty (it must not invent a discount, and must decline the drone
+question the corpus does not answer). Tone and phrasing are deliberately not asserted.
+`RAG_E2E_PROJECT_ID` reuses an ingested project so iterating does not re-pay for ~220
+chunker calls; full details in [e2e/README.md](e2e/README.md). **WhatsApp and LINE are not
+covered** — their answers arrive by push rather than on the response.
 
 ## Endpoints
 
@@ -79,6 +97,15 @@ imports live *inside* the builder functions, `model` is required, and clients ar
 `lru_cache`d because each owns a connection pool. **It holds no model names** — the four
 role functions (`agentModel`, `reviewerModel`, `summariserModel`, `chunkerModel`) read
 `config/models.toml` through [app/modelConfig.py](app/modelConfig.py); see *Model configuration*.
+**OpenAI is built with `use_responses_api=True`** — `/v1/responses`, not Chat Completions —
+because OpenAI's reasoning models refuse *function tools* on `/v1/chat/completions` with a
+400. Only the agent binds one (`searchProject`); every other role uses
+`with_structured_output`, which is a response format and works on either endpoint. So the
+symptom was ingestion succeeding, startup checks passing, `/health` green, and **every
+question 502ing**. `reasoning_effort='none'` also fixes it and turns reasoning off, which is
+the wrong trade for a persona that must ground every claim. `setdefault`, so an explicit
+override still wins. Content then arrives as blocks rather than a string;
+`agent._lastText` and `summariser.summarise` already handle both.
 [app/agent/promptStore.py](app/agent/promptStore.py) resolves a project's system prompt from
 two Firestore collections and caches the *resolved text keyed by projectId* in Redis; the
 default it falls back to is the **persona** in `config/prompts.toml`, read by
@@ -443,6 +470,15 @@ so no misconfiguration can quietly downgrade a real deployment.
    job with nothing recording it ever existed. `requeueAbandoned` at startup is what
    puts those back — and it assumes **one worker**; two sharing a processing list would
    requeue each other's live jobs.
+
+   **`RAG_QUEUE_POP_TIMEOUT` must stay below `RAG_REDIS_TIMEOUT`** (2 vs 5 today). Two
+   clocks run during a `BLMOVE`: the server holding the reply for the pop timeout, and
+   the client's own socket read timeout. Both defaulted to 5, the socket usually won, and
+   the exception came out of a call the worker makes *before* its `try` — so every idle
+   worker died on its first poll, ingestion only worked when a job happened to already be
+   queued at startup, and nothing said so: `/document/status` answered `queued` forever
+   for a job with nobody left to pick it up. `takeNext` now also catches
+   `redis.TimeoutError` and returns None, which is what the caller means by it anyway.
 10. **`RAG_STALE_JOB_SECONDS` must exceed the longest legitimate runtime**, and is off
    by default. Celery's `task_time_limit` used to guarantee an upper bound; nothing now
    can kill CPU-bound work, so reclaiming early starts a second ingestion beside a live
@@ -562,7 +598,7 @@ so no misconfiguration can quietly downgrade a real deployment.
 | `REDIS_URL` | The job table and the worker queue. Requires `GCP_PROJECT_ID`. Unset means everything runs in the API process. |
 | `RAG_JOB_TTL_SECONDS` | How long a job record survives its last write. Default 7 days; refreshed on every save. |
 | `RAG_REDIS_QUEUE` / `RAG_REDIS_JOB_PREFIX` | Key names. Default `ragQueue` / `ragJob:`. |
-| `RAG_QUEUE_POP_TIMEOUT` / `RAG_REDIS_TIMEOUT` | Worker block, and socket timeout. Default 5s each. |
+| `RAG_QUEUE_POP_TIMEOUT` / `RAG_REDIS_TIMEOUT` | Worker block, and socket timeout. 2s and 5s. The first must stay under the second — see invariant 9. |
 | `RAG_STALE_JOB_SECONDS` | Reclaim age for a stuck job. See invariant 6. |
 | `PINECONE_API_KEY`, `RAG_PINECONE_INDEX`/`_CLOUD`/`_REGION`/`_EMBED_MODEL` | Index `rag-chunks`, aws/us-east-1, `llama-text-embed-v2` — server-side embedding, so nothing here embeds. |
 | `RAG_TEST_MODE`, `RAG_LOCAL_STORE_DIR` | Local JSON chunk store instead of Pinecone. |
@@ -615,6 +651,19 @@ this service's own credentials for the infrastructure it calls, not its callers'
   a single-level archive inside the download limit can still expand without bound and OOM
   the worker. The comment on `MAX_ARCHIVE_DEPTH` already says to raise it "only alongside
   a size budget"; the budget is the part that does not exist.
+- **A chunk that does not name its subject is a chunk that will be misattributed.**
+  Not a code defect -- a corpus one, and worth recording because it looked exactly
+  like a model defect for three runs. `e2e`'s travel corpus had ten paragraphs
+  reading "Shoulder season is late March, June, September and November, and it
+  costs $4,180 per person" with nothing saying *which trip*. Chunking splits on
+  blank lines, so the index held a price with no owner, and the agent duly
+  attached it to whichever trip was under discussion -- quoting one journey's real
+  price against another. Every figure was genuine and retrieved; only the pairing
+  was wrong, which no per-answer grounding check can see, and a real price on the
+  wrong item reads to a customer as a quote. Naming the trip in each paragraph
+  fixed it. The general rule for any corpus ingested here: **a chunk has to stand
+  alone, because retrieval will make it.** `testNoPriceIsAttachedToTheWrongTrip`
+  guards it going forward.
 - **Nothing reads the usage back.** `projectTotal` and `conversationTotal` exist on the
   store and are tested; no endpoint serves them, and there is no per-message listing, no
   date bucketing and no cost-in-currency conversion — only tokens.

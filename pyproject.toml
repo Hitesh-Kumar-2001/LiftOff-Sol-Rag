@@ -43,6 +43,16 @@ dev = [
 
 [tool.pytest.ini_options]
 python_files = ["test*.py"]
+# `uv run pytest` collects tests/ and nothing else. e2e/ is a live end-to-end
+# check that needs a running server, a real worker, real Pinecone and a real
+# model provider, and it spends money on every run -- it must never be picked up
+# by an unqualified invocation. Run it deliberately: `uv run pytest e2e`.
+#
+# A marker with `addopts = "-m 'not e2e'"` was the obvious alternative and is
+# worse: the documented `-m "not slow"` invocation *replaces* addopts rather
+# than adding to it, so the e2e suite would silently start running the day
+# somebody skipped the corpus tests.
+testpaths = ["tests"]
 markers = [
     "slow: parses the tests/data corpora end to end (~2 minutes). Skip with -m 'not slow'.",
 ]

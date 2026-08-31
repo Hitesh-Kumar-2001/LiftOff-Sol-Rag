@@ -14,6 +14,7 @@ from datetime import datetime, timedelta, timezone
 
 import fakeredis
 import pytest
+from redis.exceptions import TimeoutError as RedisTimeoutError
 
 from app.jobs import jobQueue, worker
 from app.jobs.job import Job, JobConflictError, JobDispatchError, JobStatus
@@ -224,6 +225,34 @@ def testWorkAbandonedByADeadWorkerIsRequeued(redis: fakeredis.FakeRedis) -> None
 
 def testRequeueingIsSafeWhenNothingWasAbandoned(redis: fakeredis.FakeRedis) -> None:
     assert jobQueue.requeueAbandoned(redis) == 0
+
+
+def testASocketTimeoutOnTheBlockingPopReadsAsAnEmptyQueue() -> None:
+    """The bug this exists to prevent killed every idle worker in seconds.
+
+    Two clocks run during a BLMOVE: the server holding the reply for the pop
+    timeout, and the client's own socket read timeout. They were both five
+    seconds by default, the socket usually won, and the exception came out of
+    a call the worker makes *before* its try/except -- so the process died on
+    its first idle poll and ingestion only worked when a job happened to already
+    be queued at startup. Nothing said so: /document/status went on answering
+    'queued' forever for a job with nobody left to pick it up.
+    """
+
+    class TimingOutRedis:
+        def blmove(self, *args, **kwargs):
+            raise RedisTimeoutError("Timeout reading from socket")
+
+    assert jobQueue.takeNext(TimingOutRedis(), timeout=1) is None
+
+
+def testThePopTimeoutStaysUnderTheSocketTimeout() -> None:
+    """The defaults must not race in the first place. The catch above keeps a
+    misconfigured worker alive; this keeps the shipped one from reconnecting on
+    every idle cycle to get there."""
+    from app.infra.redisClient import SOCKET_TIMEOUT_SECONDS
+
+    assert jobQueue.POP_TIMEOUT_SECONDS < SOCKET_TIMEOUT_SECONDS
 
 
 # --- the manager -----------------------------------------------------------

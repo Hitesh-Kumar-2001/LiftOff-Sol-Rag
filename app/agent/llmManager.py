@@ -68,6 +68,36 @@ def _buildAnthropic(model: str, apiKey: str, **overrides: Any) -> BaseChatModel:
 def _buildOpenai(model: str, apiKey: str, **overrides: Any) -> BaseChatModel:
     from langchain_openai import ChatOpenAI
 
+    # The Responses API (/v1/responses), not Chat Completions.
+    #
+    # Not a preference. OpenAI's reasoning models refuse **function tools on
+    # /v1/chat/completions** outright:
+    #
+    #   Function tools with reasoning_effort are not supported for <model> in
+    #   /v1/chat/completions. To use function tools, use /v1/responses or set
+    #   reasoning_effort to 'none'.
+    #
+    # Which made this the sharpest failure in the service and the hardest to
+    # see. Every role that uses ``with_structured_output`` -- the reviewer, the
+    # summariser, the chunker -- kept working, because that is a response format
+    # rather than a function tool. Only the **agent** binds a real tool
+    # (``searchProject``), so ingestion succeeded, configuration checks passed,
+    # /health was green, and every single question came back 502. e2e/ is what
+    # found it; nothing in tests/ reaches a provider.
+    #
+    # Of the two fixes the vendor names, this is the one that keeps the model's
+    # reasoning. ``reasoning_effort='none'`` also works and turns reasoning off,
+    # which is precisely the capability a persona that must ground every claim
+    # and refuse to invent a price is relying on.
+    #
+    # The cost is that ``content`` arrives as a list of blocks rather than a
+    # string. Everything here that reads it already handles both --
+    # ``agent._lastText`` and ``summariser.summarise`` -- because providers
+    # already differed on this.
+    #
+    # setdefault, not assignment: an explicit override still wins, which is the
+    # way back to Chat Completions for a model that needs it.
+    overrides.setdefault("use_responses_api", True)
     return ChatOpenAI(model=model, api_key=apiKey, **overrides)
 
 

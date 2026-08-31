@@ -72,6 +72,32 @@ def testEachProviderBuildsItsOwnClient(monkeypatch, provider, model, expected) -
     assert type(built).__name__ == expected
 
 
+def testOpenaiUsesTheResponsesApi(monkeypatch) -> None:
+    """The agent binds a real function tool, and OpenAI's reasoning models
+    refuse function tools on /v1/chat/completions entirely -- 400, every
+    question, with the vendor naming /v1/responses as the fix.
+
+    Nothing else in this suite would catch a revert. The reviewer, summariser
+    and chunker all use `with_structured_output`, which is a response format
+    rather than a function tool and works on either endpoint -- so ingestion
+    would still succeed, startup checks would still pass, and only the answering
+    path would be dead.
+    """
+    monkeypatch.setenv(API_KEY_ENV[Provider.OPENAI], "test-key")
+
+    assert chatModel(Provider.OPENAI, "gpt-5.6-luna").use_responses_api is True
+
+
+def testAnExplicitOverrideStillWinsOverTheResponsesApiDefault(monkeypatch) -> None:
+    """setdefault, not assignment: a model that needs Chat Completions has a way
+    back without editing this module."""
+    monkeypatch.setenv(API_KEY_ENV[Provider.OPENAI], "test-key")
+
+    built = chatModel(Provider.OPENAI, "gpt-4o", use_responses_api=False)
+
+    assert built.use_responses_api is False
+
+
 def testAProviderCanBeNamedAsAString(monkeypatch) -> None:
     monkeypatch.setenv(API_KEY_ENV[Provider.ANTHROPIC], "test-key")
 
