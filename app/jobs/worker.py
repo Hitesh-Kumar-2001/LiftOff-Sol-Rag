@@ -34,6 +34,12 @@ from app.jobs.queuedJobManager import runJobHere
 
 logger = logging.getLogger(__name__)
 
+# How long to wait before reading the queue again after the read itself failed.
+# Long enough that a Redis restart is ridden out in a handful of log lines
+# rather than hundreds, short enough that work queued during the outage is
+# picked up promptly once it is back.
+QUEUE_RETRY_SECONDS = 5.0
+
 _stopping = False
 
 
@@ -89,7 +95,27 @@ async def workForever() -> None:
         # In a thread: this blocks for POP_TIMEOUT_SECONDS, and doing that on
         # the event loop would freeze everything else the loop is running --
         # including, on shutdown, the chance to notice the flag.
-        ragDbId = await asyncio.to_thread(takeNext, redis)
+        #
+        # Guarded, and this is the guard that was missing. The `except` below
+        # covers running a job; reading the queue sat *outside* any handler, so
+        # anything the pop raised ended the process rather than being logged and
+        # retried. That is how a five-second socket timeout on an idle worker
+        # became a dead worker -- see `takeNext`, which now answers None for
+        # that specific case. This handles the rest of the family: a Redis
+        # restart, a failover, a dropped connection while nothing was queued.
+        #
+        # Dying here is the worst available response, because it is silent. The
+        # API goes on accepting documents and `/document/status` goes on
+        # answering `queued`, forever, for work with nobody left to pick it up.
+        try:
+            ragDbId = await asyncio.to_thread(takeNext, redis)
+        except Exception:
+            logger.exception(
+                "Could not read the queue; retrying in %ss.", QUEUE_RETRY_SECONDS
+            )
+            await asyncio.sleep(QUEUE_RETRY_SECONDS)
+            continue
+
         if ragDbId is None:
             continue
 

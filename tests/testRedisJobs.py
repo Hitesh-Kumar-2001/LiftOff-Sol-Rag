@@ -388,3 +388,46 @@ def testTheWorkerPublishesProcessingBeforeItFinishes(store: RedisJobStore) -> No
     asyncio.run(worker.runOne(RAG_DB, store, Watching()))
 
     assert seen == [JobStatus.PROCESSING.value]
+
+
+def testAQueueReadFailureDoesNotKillTheWorker(monkeypatch, redis) -> None:
+    """The guard that was missing, and the reason a dead worker is so expensive.
+
+    The worker's ``except`` covers *running* a job. Reading the queue sat
+    outside any handler, so anything the pop raised ended the process -- which
+    is how an idle worker died of a five-second socket timeout. ``takeNext``
+    now answers None for that specific case; this covers the rest of the family
+    (a Redis restart, a failover, a dropped connection) by driving the real
+    loop with a pop that raises.
+
+    Silence is what makes it costly: the API goes on accepting documents and
+    ``/document/status`` goes on answering ``queued``, forever, for work with
+    nobody left to pick it up.
+    """
+    calls: list[int] = []
+
+    def failThenStop(_redis, timeout=None):
+        calls.append(1)
+        if len(calls) == 1:
+            raise ConnectionError("redis went away")
+        # Survived the first failure and came back for more, which is the
+        # whole claim. Stop the loop so the test terminates.
+        monkeypatch.setattr(worker, "_stopping", True)
+        return None
+
+    monkeypatch.setattr(worker, "takeNext", failThenStop)
+    monkeypatch.setattr(worker, "requeueAbandoned", lambda _redis: 0)
+    monkeypatch.setattr(worker, "redisClient", lambda: redis)
+    monkeypatch.setattr(worker, "QUEUE_RETRY_SECONDS", 0)
+    monkeypatch.setattr(worker, "_stopping", False)
+
+    class _Processor:
+        pass
+
+    monkeypatch.setattr(
+        "app.ingestion.ragProcessor.RagIngestionProcessor", lambda *a, **k: _Processor()
+    )
+
+    asyncio.run(asyncio.wait_for(worker.workForever(), timeout=5))
+
+    assert len(calls) == 2, "the worker did not come back after a failed queue read"

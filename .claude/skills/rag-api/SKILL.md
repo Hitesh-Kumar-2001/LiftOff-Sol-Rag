@@ -99,8 +99,11 @@ role functions (`agentModel`, `reviewerModel`, `summariserModel`, `chunkerModel`
 `config/models.toml` through [app/modelConfig.py](app/modelConfig.py); see *Model configuration*.
 **OpenAI is built with `use_responses_api=True`** — `/v1/responses`, not Chat Completions —
 because OpenAI's reasoning models refuse *function tools* on `/v1/chat/completions` with a
-400. Only the agent binds one (`searchProject`); every other role uses
-`with_structured_output`, which is a response format and works on either endpoint. So the
+400 — measured across the whole 5.6 generation (luna, sol *and* terra all refuse
+identically; 5.5 and 5.4 accept them), so **moving to a newer model is not a way out of
+this**, only an older one would be. Only the agent binds a tool (`searchProject`); every
+other role uses `with_structured_output`, which `ChatOpenAI` defaults to
+`method="json_schema"` — a response format, not a tool — and works on either endpoint. So the
 symptom was ingestion succeeding, startup checks passing, `/health` green, and **every
 question 502ing**. `reasoning_effort='none'` also fixes it and turns reasoning off, which is
 the wrong trade for a persona that must ground every claim. `setdefault`, so an explicit
@@ -471,14 +474,23 @@ so no misconfiguration can quietly downgrade a real deployment.
    puts those back — and it assumes **one worker**; two sharing a processing list would
    requeue each other's live jobs.
 
-   **`RAG_QUEUE_POP_TIMEOUT` must stay below `RAG_REDIS_TIMEOUT`** (2 vs 5 today). Two
-   clocks run during a `BLMOVE`: the server holding the reply for the pop timeout, and
-   the client's own socket read timeout. Both defaulted to 5, the socket usually won, and
-   the exception came out of a call the worker makes *before* its `try` — so every idle
-   worker died on its first poll, ingestion only worked when a job happened to already be
+   **`RAG_QUEUE_POP_TIMEOUT` must stay below `RAG_REDIS_TIMEOUT`** (2 vs 5 today), and
+   **the queue read must never raise into the loop**. Two clocks run during a `BLMOVE`:
+   the server holding the reply for the pop timeout, and the client's own socket read
+   timeout. Both defaulted to 5 — and at equal values the client wins *deterministically*,
+   because the server's clock starts only after the request has crossed the network, so
+   its reply is always due later than the client's patience. Every idle worker therefore
+   died on its first poll. Ingestion only ever worked when a job happened to already be
    queued at startup, and nothing said so: `/document/status` answered `queued` forever
-   for a job with nobody left to pick it up. `takeNext` now also catches
-   `redis.TimeoutError` and returns None, which is what the caller means by it anyway.
+   for a job with nobody left to pick it up.
+
+   Three parts to the fix, and the third is the structural one. `takeNext` catches
+   `redis.TimeoutError` and returns None, which is what the caller means by it anyway;
+   the default pop timeout dropped to 2s so the normal path never relies on that catch;
+   and `workForever` now wraps the pop itself, because it sat **outside** the `except` that
+   exists to keep the worker alive — that handler only ever covered *running* a job. A
+   Redis restart while idle would still have killed the process. It logs and retries after
+   `QUEUE_RETRY_SECONDS` instead.
 10. **`RAG_STALE_JOB_SECONDS` must exceed the longest legitimate runtime**, and is off
    by default. Celery's `task_time_limit` used to guarantee an upper bound; nothing now
    can kill CPU-bound work, so reclaiming early starts a second ingestion beside a live
